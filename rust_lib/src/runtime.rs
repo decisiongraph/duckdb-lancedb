@@ -1,14 +1,18 @@
 //! Tokio runtime for blocking on LanceDB async operations.
 //!
-//! Uses a small thread pool (2 workers) since DuckDB manages its own parallelism.
-//! We only need enough threads to handle async I/O from LanceDB/Lance.
+//! Thread count scales with available cores (capped at 4) since DuckDB manages
+//! its own parallelism — we only need enough threads for async Lance I/O.
 
 use std::sync::LazyLock;
 use tokio::runtime::Runtime;
 
 static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(4))
+        .unwrap_or(2);
+
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+        .worker_threads(threads)
         .thread_name("lance-io")
         .enable_all()
         .build()
