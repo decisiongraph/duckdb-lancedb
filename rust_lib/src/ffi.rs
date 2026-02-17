@@ -271,6 +271,28 @@ pub unsafe extern "C" fn lance_detached_create_index(
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn lance_detached_create_hnsw_index(
+    handle: LanceHandlePtr,
+    m: i32,
+    ef_construction: i32,
+    err_buf: *mut c_char,
+    err_buf_len: i32,
+) -> i32 {
+    if handle.is_null() {
+        write_err(err_buf, err_buf_len, "null handle");
+        return -1;
+    }
+    let h = &*(handle as *mut LanceIndex);
+    match h.create_hnsw_index(m as u32, ef_construction as u32) {
+        Ok(()) => 0,
+        Err(e) => {
+            write_err(err_buf, err_buf_len, &format!("create_hnsw_index failed: {}", e));
+            -1
+        }
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn lance_detached_compact(
     handle: LanceHandlePtr,
     err_buf: *mut c_char,

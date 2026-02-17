@@ -261,6 +261,45 @@ impl LanceIndex {
         Ok(())
     }
 
+    /// Create an ANN index (IVF_HNSW_SQ).
+    ///
+    /// `m` is the number of edges per node in the HNSW graph.
+    /// `ef_construction` is the search width during index build.
+    pub fn create_hnsw_index(
+        &self,
+        m: u32,
+        ef_construction: u32,
+    ) -> Result<()> {
+        let table = self.get_table()?;
+
+        use lancedb::index::vector::IvfHnswSqIndexBuilder;
+        use lancedb::index::Index;
+
+        let distance_type = match self.metric.as_str() {
+            "cosine" => lancedb::DistanceType::Cosine,
+            "dot" | "ip" => lancedb::DistanceType::Dot,
+            _ => lancedb::DistanceType::L2,
+        };
+
+        let mut builder = IvfHnswSqIndexBuilder::default()
+            .distance_type(distance_type);
+        if m > 0 {
+            builder = builder.num_edges(m);
+        }
+        if ef_construction > 0 {
+            builder = builder.ef_construction(ef_construction);
+        }
+
+        runtime::block_on(
+            table
+                .create_index(&["vector"], Index::IvfHnswSq(builder))
+                .replace(true)
+                .execute(),
+        )?;
+
+        Ok(())
+    }
+
     /// Compact the dataset (optimize storage).
     pub fn compact(&self) -> Result<()> {
         let table = self.get_table()?;

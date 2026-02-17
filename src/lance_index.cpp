@@ -382,6 +382,13 @@ void LanceIndex::CreateAnnIndex(int32_t num_partitions, int32_t num_sub_vectors)
 	LanceDetachedCreateIndex(rust_handle_, num_partitions, num_sub_vectors);
 }
 
+void LanceIndex::CreateHnswIndex(int32_t m, int32_t ef_construction) {
+	if (!rust_handle_) {
+		throw IOException("Lance index not initialized");
+	}
+	LanceDetachedCreateHnswIndex(rust_handle_, m, ef_construction);
+}
+
 // ========================================
 // Persistence (metadata only — Lance handles vector data)
 // ========================================

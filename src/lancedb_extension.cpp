@@ -23,6 +23,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register table functions
 	RegisterLanceSearchFunction(loader);
 	RegisterLanceCreateAnnIndexFunction(loader);
+	RegisterLanceCreateHnswIndexFunction(loader);
 	RegisterLanceInfoFunction(loader);
 
 	// Register optimizer

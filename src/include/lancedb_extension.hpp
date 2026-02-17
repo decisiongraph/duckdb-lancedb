@@ -13,6 +13,7 @@ public:
 
 void RegisterLanceSearchFunction(ExtensionLoader &loader);
 void RegisterLanceCreateAnnIndexFunction(ExtensionLoader &loader);
+void RegisterLanceCreateHnswIndexFunction(ExtensionLoader &loader);
 void RegisterLanceInfoFunction(ExtensionLoader &loader);
 void RegisterLanceOptimizer(DatabaseInstance &db);
 

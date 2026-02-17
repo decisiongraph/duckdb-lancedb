@@ -27,6 +27,8 @@ int32_t lance_detached_delete_batch(void *handle, const int64_t *labels, int32_t
                                     int err_buf_len);
 int32_t lance_detached_create_index(void *handle, int32_t num_partitions, int32_t num_sub_vectors, char *err_buf,
                                     int err_buf_len);
+int32_t lance_detached_create_hnsw_index(void *handle, int32_t m, int32_t ef_construction, char *err_buf,
+                                          int err_buf_len);
 int32_t lance_detached_compact(void *handle, char *err_buf, int err_buf_len);
 int32_t lance_detached_get_vector(void *handle, int64_t label, float *out_vec, int32_t capacity, char *err_buf,
                                   int err_buf_len);
@@ -117,6 +119,14 @@ void LanceDetachedCreateIndex(LanceHandle handle, int32_t num_partitions, int32_
 	int32_t rc = lance_detached_create_index(handle, num_partitions, num_sub_vectors, err_buf, ERR_BUF_LEN);
 	if (rc != 0) {
 		throw IOException("Lance create_index: " + std::string(err_buf));
+	}
+}
+
+void LanceDetachedCreateHnswIndex(LanceHandle handle, int32_t m, int32_t ef_construction) {
+	char err_buf[ERR_BUF_LEN] = {0};
+	int32_t rc = lance_detached_create_hnsw_index(handle, m, ef_construction, err_buf, ERR_BUF_LEN);
+	if (rc != 0) {
+		throw IOException("Lance create_hnsw_index: " + std::string(err_buf));
 	}
 }
 

@@ -29,6 +29,7 @@ void LanceDetachedDelete(LanceHandle handle, int64_t label);
 void LanceDetachedDeleteBatch(LanceHandle handle, const int64_t *labels, int32_t count);
 
 void LanceDetachedCreateIndex(LanceHandle handle, int32_t num_partitions, int32_t num_sub_vectors);
+void LanceDetachedCreateHnswIndex(LanceHandle handle, int32_t m, int32_t ef_construction);
 void LanceDetachedCompact(LanceHandle handle);
 
 int32_t LanceDetachedGetVector(LanceHandle handle, int64_t label, float *out_vec, int32_t capacity);

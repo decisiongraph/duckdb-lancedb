@@ -1,0 +1,44 @@
+# name: test/sql/lance_hnsw.test
+# description: Test HNSW index creation and search
+# group: [lance]
+
+require lancedb
+
+# Create table with vectors
+statement ok
+CREATE TABLE hnsw_vectors (id INT, embedding FLOAT[3]);
+
+# Insert enough vectors for index building (Lance needs sufficient data)
+statement ok
+INSERT INTO hnsw_vectors
+SELECT i, [sin(i::FLOAT), cos(i::FLOAT), (i % 10)::FLOAT / 10.0]
+FROM range(0, 256) t(i);
+
+# Create LANCE index
+statement ok
+CREATE INDEX hnsw_idx ON hnsw_vectors USING LANCE (embedding);
+
+# Build HNSW index (m=20, ef_construction=50)
+query I
+SELECT * FROM lance_create_hnsw_index('hnsw_vectors', 'hnsw_idx', 20, 50);
+----
+HNSW index created
+
+# Search still works after HNSW index creation
+query I
+SELECT count(*) > 0 FROM lance_search('hnsw_vectors', 'hnsw_idx', [0.0, 1.0, 0.0], 5);
+----
+true
+
+# Search returns correct number of results
+query I
+SELECT count(*) FROM lance_search('hnsw_vectors', 'hnsw_idx', [0.0, 1.0, 0.0], 3);
+----
+3
+
+# Clean up
+statement ok
+DROP INDEX hnsw_idx;
+
+statement ok
+DROP TABLE hnsw_vectors;

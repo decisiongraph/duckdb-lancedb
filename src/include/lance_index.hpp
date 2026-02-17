@@ -54,6 +54,7 @@ public:
 
 	// Build ANN index on the Lance dataset
 	void CreateAnnIndex(int32_t num_partitions, int32_t num_sub_vectors);
+	void CreateHnswIndex(int32_t m, int32_t ef_construction);
 
 	int32_t GetDimension() const {
 		return dimension_;
