@@ -350,41 +350,19 @@ vector<pair<row_t, float>> LanceIndex::Search(const float *query, int32_t dimens
 		return {};
 	}
 
-	auto total = static_cast<int32_t>(label_to_rowid_.size());
-	if (total <= 0) {
-		return {};
-	}
+	// Lance already excludes deleted vectors (Delete() calls LanceDetachedDeleteBatch),
+	// so no C++ tombstone filtering or retry loop needed.
+	vector<int64_t> labels(k);
+	vector<float> distances(k);
+	auto n = LanceDetachedSearch(rust_handle_, query, dimension, k, nprobes_, refine_factor_,
+	                             labels.data(), distances.data());
 
-	// Retry with increasing multiplier until we get k live results or exhaust data.
-	// This handles the case where many tombstones exist (e.g., 1000 tombstones + k=10).
 	vector<pair<row_t, float>> results;
-	results.reserve(k);
-
-	for (int32_t multiplier = 2; multiplier <= 32; multiplier *= 2) {
-		int32_t request_k = MinValue<int32_t>(k * multiplier, total);
-		if (request_k <= 0) {
-			break;
-		}
-
-		vector<int64_t> labels(request_k);
-		vector<float> distances(request_k);
-		auto n = LanceDetachedSearch(rust_handle_, query, dimension, request_k, nprobes_, refine_factor_,
-		                             labels.data(), distances.data());
-
-		results.clear();
-		for (int32_t i = 0; i < n && static_cast<int32_t>(results.size()) < k; i++) {
-			auto label = labels[i];
-			if (deleted_labels_.count(label) > 0) {
-				continue;
-			}
-			if (label < static_cast<int64_t>(label_to_rowid_.size())) {
-				results.emplace_back(label_to_rowid_[label], distances[i]);
-			}
-		}
-
-		// Got enough results or already fetched everything
-		if (static_cast<int32_t>(results.size()) >= k || request_k >= total) {
-			break;
+	results.reserve(n);
+	for (int32_t i = 0; i < n; i++) {
+		auto label = labels[i];
+		if (label >= 0 && label < static_cast<int64_t>(label_to_rowid_.size())) {
+			results.emplace_back(label_to_rowid_[label], distances[i]);
 		}
 	}
 
