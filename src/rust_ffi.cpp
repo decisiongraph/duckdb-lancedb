@@ -12,8 +12,8 @@ struct LanceBytesFFI {
 	size_t capacity;
 };
 
-void *lance_create_detached(const char *db_path, int32_t dimension, const char *metric, char *err_buf,
-                            int err_buf_len);
+void *lance_create_detached(const char *db_path, int32_t dimension, const char *metric, const char *table_name,
+                            char *err_buf, int err_buf_len);
 void lance_free_detached(void *handle);
 int64_t lance_detached_add(void *handle, const float *vector, int32_t dimension, char *err_buf, int err_buf_len);
 int32_t lance_detached_add_batch(void *handle, const float *vectors, int32_t num, int32_t dim, int64_t *out_labels,
@@ -42,9 +42,11 @@ namespace duckdb {
 
 constexpr int ERR_BUF_LEN = 2048;
 
-LanceHandle LanceCreateDetached(const std::string &db_path, int32_t dimension, const std::string &metric) {
+LanceHandle LanceCreateDetached(const std::string &db_path, int32_t dimension, const std::string &metric,
+                                const std::string &table_name) {
 	char err_buf[ERR_BUF_LEN] = {0};
-	auto handle = lance_create_detached(db_path.c_str(), dimension, metric.c_str(), err_buf, ERR_BUF_LEN);
+	auto handle = lance_create_detached(db_path.c_str(), dimension, metric.c_str(), table_name.c_str(), err_buf,
+	                                    ERR_BUF_LEN);
 	if (!handle) {
 		throw IOException("Lance create: " + std::string(err_buf));
 	}

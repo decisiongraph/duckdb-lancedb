@@ -8,8 +8,9 @@ namespace duckdb {
 
 typedef void *LanceHandle;
 
-// Create a Lance dataset at db_path. Throws on error.
-LanceHandle LanceCreateDetached(const std::string &db_path, int32_t dimension, const std::string &metric);
+// Create a Lance dataset at db_path. table_name identifies the Lance table within the dataset.
+LanceHandle LanceCreateDetached(const std::string &db_path, int32_t dimension, const std::string &metric,
+                                const std::string &table_name);
 void LanceFreeDetached(LanceHandle handle);
 
 // Add single vector. Returns label.

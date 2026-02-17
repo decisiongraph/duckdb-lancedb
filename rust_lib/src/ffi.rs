@@ -45,13 +45,15 @@ pub unsafe extern "C" fn lance_create_detached(
     db_path: *const c_char,
     dimension: i32,
     metric: *const c_char,
+    table_name: *const c_char,
     err_buf: *mut c_char,
     err_buf_len: i32,
 ) -> LanceHandlePtr {
     let db_path_str = c_str_to_string(db_path);
     let metric_str = c_str_to_string(metric);
+    let table_name_str = c_str_to_string(table_name);
 
-    match LanceIndex::create(&db_path_str, dimension as usize, &metric_str) {
+    match LanceIndex::create(&db_path_str, dimension as usize, &metric_str, &table_name_str) {
         Ok(index) => Box::into_raw(Box::new(index)) as LanceHandlePtr,
         Err(e) => {
             write_err(err_buf, err_buf_len, &format!("create failed: {}", e));

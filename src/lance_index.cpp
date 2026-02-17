@@ -259,7 +259,8 @@ ErrorData LanceIndex::Append(IndexLock &lock, DataChunk &entries, Vector &row_id
 
 	if (!rust_handle_) {
 		auto lance_path = GetLancePath();
-		rust_handle_ = LanceCreateDetached(lance_path, dimension_, metric_);
+		auto table_name = SanitizeIndexName(name);
+		rust_handle_ = LanceCreateDetached(lance_path, dimension_, metric_, table_name);
 	}
 
 	auto &vec_col = expr_chunk.data[0];
@@ -689,7 +690,7 @@ unique_ptr<GlobalSinkState> PhysicalCreateLanceIndex::GetGlobalSinkState(ClientC
 		fs.CreateDirectory(parent);
 	}
 
-	state->rust_handle = LanceCreateDetached(state->lance_path, state->dimension, state->metric);
+	state->rust_handle = LanceCreateDetached(state->lance_path, state->dimension, state->metric, sanitized);
 	return std::move(state);
 }
 

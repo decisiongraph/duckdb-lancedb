@@ -28,11 +28,11 @@ pub struct LanceIndex {
 
 impl LanceIndex {
     /// Create a new Lance dataset at the given path.
-    pub fn create(db_path: &str, dimension: usize, metric: &str) -> Result<Self> {
+    pub fn create(db_path: &str, dimension: usize, metric: &str, table_name: &str) -> Result<Self> {
         let connection = runtime::block_on(lancedb::connect(db_path).execute())?;
 
         let schema = Self::build_schema(dimension);
-        let table_name = "vectors".to_string();
+        let table_name = table_name.to_string();
 
         // Create empty table with schema (drop existing if present)
         let empty_batch = Self::empty_batch(&schema, dimension)?;
@@ -57,9 +57,9 @@ impl LanceIndex {
     }
 
     /// Reopen an existing Lance dataset.
-    pub fn open(db_path: &str, dimension: usize, metric: &str) -> Result<Self> {
+    pub fn open(db_path: &str, dimension: usize, metric: &str, table_name: &str) -> Result<Self> {
         let connection = runtime::block_on(lancedb::connect(db_path).execute())?;
-        let table_name = "vectors".to_string();
+        let table_name = table_name.to_string();
         let table = runtime::block_on(connection.open_table(&table_name).execute())?;
 
         let schema = Self::build_schema(dimension);
@@ -378,7 +378,7 @@ impl LanceIndex {
     /// Deserialize metadata and reopen the Lance dataset.
     pub fn deserialize_meta(db_path: &str, data: &[u8]) -> Result<Self> {
         let meta: LanceMeta = serde_json::from_slice(data)?;
-        let mut index = Self::open(db_path, meta.dimension, &meta.metric)?;
+        let mut index = Self::open(db_path, meta.dimension, &meta.metric, &meta.table_name)?;
         index.next_label = AtomicI64::new(meta.next_label);
         Ok(index)
     }
@@ -498,7 +498,7 @@ mod tests {
         let db_path_str = db_path.to_str().unwrap();
 
         // Insert 5 vectors with labels [0,1,2,3,4]
-        let idx = LanceIndex::create(db_path_str, 3, "l2").unwrap();
+        let idx = LanceIndex::create(db_path_str, 3, "l2", "vectors").unwrap();
         for i in 0..5 {
             let label = idx.add_vector(&[i as f32, 0.0, 0.0]).unwrap();
             assert_eq!(label, i);
@@ -510,7 +510,7 @@ mod tests {
 
         // Reopen — next insert must NOT produce label 3 (already exists)
         drop(idx);
-        let idx2 = LanceIndex::open(db_path_str, 3, "l2").unwrap();
+        let idx2 = LanceIndex::open(db_path_str, 3, "l2", "vectors").unwrap();
         let new_label = idx2.add_vector(&[99.0, 0.0, 0.0]).unwrap();
         assert!(
             new_label >= 5,
@@ -524,10 +524,10 @@ mod tests {
         let db_path = dir.path().join("test_empty.lance");
         let db_path_str = db_path.to_str().unwrap();
 
-        let idx = LanceIndex::create(db_path_str, 2, "l2").unwrap();
+        let idx = LanceIndex::create(db_path_str, 2, "l2", "vectors").unwrap();
         drop(idx);
 
-        let idx2 = LanceIndex::open(db_path_str, 2, "l2").unwrap();
+        let idx2 = LanceIndex::open(db_path_str, 2, "l2", "vectors").unwrap();
         let label = idx2.add_vector(&[1.0, 2.0]).unwrap();
         assert_eq!(label, 0);
     }
@@ -538,7 +538,7 @@ mod tests {
         let db_path = dir.path().join("test_meta.lance");
         let db_path_str = db_path.to_str().unwrap();
 
-        let idx = LanceIndex::create(db_path_str, 3, "l2").unwrap();
+        let idx = LanceIndex::create(db_path_str, 3, "l2", "vectors").unwrap();
         for i in 0..5 {
             idx.add_vector(&[i as f32, 0.0, 0.0]).unwrap();
         }
@@ -554,5 +554,31 @@ mod tests {
             new_label >= 5,
             "expected label >= 5 via deserialize_meta, got {new_label}"
         );
+    }
+
+    #[test]
+    fn test_custom_table_name() {
+        let dir = temp_dir();
+        let db_path = dir.path().join("test_tbl.lance");
+        let db_path_str = db_path.to_str().unwrap();
+
+        // Two indexes in same dataset with different table names
+        let idx_a = LanceIndex::create(db_path_str, 2, "l2", "idx_a").unwrap();
+        let idx_b = LanceIndex::create(db_path_str, 2, "l2", "idx_b").unwrap();
+
+        idx_a.add_vector(&[1.0, 0.0]).unwrap();
+        idx_a.add_vector(&[2.0, 0.0]).unwrap();
+        idx_b.add_vector(&[10.0, 0.0]).unwrap();
+
+        assert_eq!(idx_a.count().unwrap(), 2);
+        assert_eq!(idx_b.count().unwrap(), 1);
+
+        // Reopen each — they stay independent
+        drop(idx_a);
+        drop(idx_b);
+        let idx_a2 = LanceIndex::open(db_path_str, 2, "l2", "idx_a").unwrap();
+        let idx_b2 = LanceIndex::open(db_path_str, 2, "l2", "idx_b").unwrap();
+        assert_eq!(idx_a2.count().unwrap(), 2);
+        assert_eq!(idx_b2.count().unwrap(), 1);
     }
 }
