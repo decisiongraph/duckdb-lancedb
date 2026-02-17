@@ -4,6 +4,8 @@
 
 require lancedb
 
+load __TEST_DIR__/lance_delete.db
+
 statement ok
 CREATE TABLE vectors (id INT, embedding FLOAT[3]);
 
@@ -31,6 +33,26 @@ query I
 SELECT count(*) FROM lance_search('vectors', 'idx', [0.5, 0.5, 0.0], 10);
 ----
 2
+
+# Verify deletes survive checkpoint + restart
+statement ok
+CHECKPOINT;
+
+restart
+
+query I
+SELECT count(*) FROM lance_search('vectors', 'idx', [0.5, 0.5, 0.0], 10);
+----
+2
+
+# Insert after delete+restart should work (labels stay unique)
+statement ok
+INSERT INTO vectors VALUES (4, [0.5, 0.5, 0.5]);
+
+query I
+SELECT count(*) FROM lance_search('vectors', 'idx', [0.5, 0.5, 0.0], 10);
+----
+3
 
 statement ok
 DROP INDEX idx;

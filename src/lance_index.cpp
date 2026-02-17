@@ -317,8 +317,12 @@ void LanceIndex::Delete(IndexLock &lock, DataChunk &entries, Vector &row_identif
 
 		auto it = rowid_to_label_.find(row_id);
 		if (it != rowid_to_label_.end()) {
-			deleted_labels_.insert(it->second);
-			labels_to_delete.push_back(it->second);
+			auto label = it->second;
+			labels_to_delete.push_back(label);
+			// Mark slot as deleted in forward mapping
+			if (label >= 0 && static_cast<idx_t>(label) < label_to_rowid_.size()) {
+				label_to_rowid_[label] = static_cast<row_t>(-1);
+			}
 			rowid_to_label_.erase(it);
 		}
 	}
@@ -326,6 +330,7 @@ void LanceIndex::Delete(IndexLock &lock, DataChunk &entries, Vector &row_identif
 	if (rust_handle_ && !labels_to_delete.empty()) {
 		LanceDetachedDeleteBatch(rust_handle_, labels_to_delete.data(),
 		                         static_cast<int32_t>(labels_to_delete.size()));
+		has_pending_deletes_ = true;
 	}
 
 	is_dirty_ = true;
@@ -408,13 +413,11 @@ void LanceIndex::PersistToDisk() {
 		writer.Write(reinterpret_cast<const uint8_t *>(label_to_rowid_.data()), num_mappings * sizeof(row_t));
 	}
 
-	// Write deleted labels
-	uint64_t num_tombstones = deleted_labels_.size();
+	// Tombstone section: write 0 for format compatibility.
+	// Deleted labels are tracked via sentinel (-1) in label_to_rowid_ above;
+	// Lance handles delete filtering natively.
+	uint64_t num_tombstones = 0;
 	writer.Write(reinterpret_cast<const uint8_t *>(&num_tombstones), sizeof(uint64_t));
-	if (num_tombstones > 0) {
-		vector<int64_t> tombstone_vec(deleted_labels_.begin(), deleted_labels_.end());
-		writer.Write(reinterpret_cast<const uint8_t *>(tombstone_vec.data()), num_tombstones * sizeof(int64_t));
-	}
 
 	// Write parameters
 	writer.Write(reinterpret_cast<const uint8_t *>(&dimension_), sizeof(int32_t));
@@ -459,13 +462,18 @@ void LanceIndex::LoadFromStorage(const IndexStorageInfo &info) {
 		reader.Read(reinterpret_cast<uint8_t *>(label_to_rowid_.data()), num_mappings * sizeof(row_t));
 	}
 
-	// Read deleted labels
+	// Read legacy tombstones (for backward compat with old persisted indexes).
+	// Apply them as sentinel values in label_to_rowid_ instead.
 	uint64_t num_tombstones = 0;
 	reader.Read(reinterpret_cast<uint8_t *>(&num_tombstones), sizeof(uint64_t));
 	if (num_tombstones > 0) {
 		vector<int64_t> tombstones(num_tombstones);
 		reader.Read(reinterpret_cast<uint8_t *>(tombstones.data()), num_tombstones * sizeof(int64_t));
-		deleted_labels_.insert(tombstones.begin(), tombstones.end());
+		for (auto label : tombstones) {
+			if (label >= 0 && static_cast<idx_t>(label) < label_to_rowid_.size()) {
+				label_to_rowid_[label] = static_cast<row_t>(-1);
+			}
+		}
 	}
 
 	// Read parameters
@@ -485,9 +493,9 @@ void LanceIndex::LoadFromStorage(const IndexStorageInfo &info) {
 	reader.Read(reinterpret_cast<uint8_t *>(path_buf.data()), path_len);
 	string lance_path(path_buf.data(), path_len);
 
-	// Rebuild reverse mappings
+	// Rebuild reverse mappings (skip deleted/unassigned slots marked as -1)
 	for (size_t i = 0; i < label_to_rowid_.size(); i++) {
-		if (deleted_labels_.count(static_cast<int64_t>(i)) == 0) {
+		if (label_to_rowid_[i] != static_cast<row_t>(-1)) {
 			rowid_to_label_[label_to_rowid_[i]] = static_cast<int64_t>(i);
 		}
 	}
@@ -558,10 +566,10 @@ bool LanceIndex::MergeIndexes(IndexLock &state, BoundIndex &other_index) {
 
 	for (int64_t i = 0; i < other_vec_count; i++) {
 		auto label = other_labels[i];
-		if (other.deleted_labels_.count(label) > 0) {
+		if (label < 0 || label >= static_cast<int64_t>(other.label_to_rowid_.size())) {
 			continue;
 		}
-		if (label >= static_cast<int64_t>(other.label_to_rowid_.size())) {
+		if (other.label_to_rowid_[label] == static_cast<row_t>(-1)) {
 			continue;
 		}
 
@@ -594,11 +602,11 @@ bool LanceIndex::MergeIndexes(IndexLock &state, BoundIndex &other_index) {
 }
 
 void LanceIndex::Vacuum(IndexLock &state) {
-	if (deleted_labels_.empty() || !rust_handle_) {
+	if (!has_pending_deletes_ || !rust_handle_) {
 		return;
 	}
 	LanceDetachedCompact(rust_handle_);
-	deleted_labels_.clear();
+	has_pending_deletes_ = false;
 	is_dirty_ = true;
 }
 
