@@ -1,0 +1,84 @@
+# name: test/sql/lance_text_columns.test
+# description: Test multi-column LANCE index with text + metadata columns
+# group: [lance]
+
+require lancedb
+
+# Create table with vectors and text/metadata columns
+statement ok
+CREATE TABLE docs (id INT, content VARCHAR, lang VARCHAR, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO docs VALUES
+  (1, 'hello world', 'en', [1.0, 0.0, 0.0]),
+  (2, 'bonjour monde', 'fr', [0.0, 1.0, 0.0]),
+  (3, 'hola mundo', 'es', [0.0, 0.0, 1.0]);
+
+# Multi-column LANCE index
+statement ok
+CREATE INDEX docs_idx ON docs USING LANCE (embedding, content, lang);
+
+# Verify index exists
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'docs_idx';
+----
+1
+
+# Vector search still works
+query IR
+SELECT d.id, s.distance
+FROM lance_search('docs', 'docs_idx', [1.0, 0.0, 0.0], 1) s
+JOIN docs d ON d.rowid = s.row_id;
+----
+1	0.000000
+
+# Search returns all 3
+query IR
+SELECT d.id, s.distance
+FROM lance_search('docs', 'docs_idx', [1.0, 0.0, 0.0], 3) s
+JOIN docs d ON d.rowid = s.row_id
+ORDER BY s.distance;
+----
+1	0.000000
+2	2.000000
+3	2.000000
+
+# Insert more (Append path with extra columns)
+statement ok
+INSERT INTO docs VALUES (4, 'new doc', 'en', [0.9, 0.1, 0.0]);
+
+# Search finds new row — top 2 nearest to [1,0,0]
+query I
+SELECT d.id
+FROM lance_search('docs', 'docs_idx', [1.0, 0.0, 0.0], 2) s
+JOIN docs d ON d.rowid = s.row_id
+ORDER BY s.distance;
+----
+1
+4
+
+# Delete and re-search
+statement ok
+DELETE FROM docs WHERE id = 2;
+
+query I
+SELECT count(*)
+FROM lance_search('docs', 'docs_idx', [0.0, 1.0, 0.0], 3) s
+JOIN docs d ON d.rowid = s.row_id;
+----
+3
+
+# lance_info shows the index
+query I
+SELECT count(*) FROM lance_info() WHERE name = 'docs_idx';
+----
+1
+
+# Drop
+statement ok
+DROP INDEX docs_idx;
+
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'docs_idx';
+----
+0

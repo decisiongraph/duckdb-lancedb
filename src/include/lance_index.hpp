@@ -82,6 +82,9 @@ private:
 	// Cached Lance dataset path (generated once, reused)
 	string lance_path_;
 
+	// Table name within the Lance dataset
+	string table_name_;
+
 	// Parameters
 	int32_t dimension_ = 0;
 	string metric_ = "l2";
@@ -94,6 +97,11 @@ private:
 
 	// Track whether deletes occurred since last vacuum
 	bool has_pending_deletes_ = false;
+
+	// Extra column configuration (populated from index expressions beyond first)
+	vector<string> extra_column_names_;
+	vector<LogicalType> extra_column_types_;
+	bool has_extra_columns_ = false;
 
 	// Block storage (metadata only)
 	unique_ptr<FixedSizeAllocator> block_allocator_;

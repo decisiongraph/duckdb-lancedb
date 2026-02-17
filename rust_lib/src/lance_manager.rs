@@ -2,10 +2,12 @@
 
 use anyhow::{anyhow, Result};
 use arrow_array::{
-    ArrayRef, Float32Array, Int64Array, RecordBatch, RecordBatchIterator,
-    FixedSizeListArray,
+    Array, ArrayRef, Float32Array, Int64Array, RecordBatch, RecordBatchIterator,
+    FixedSizeListArray, StructArray,
 };
 use arrow_schema::{DataType, Field, Schema};
+use arrow::compute::cast;
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use futures_util::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, Table as LanceTable};
@@ -27,17 +29,16 @@ pub struct LanceIndex {
 }
 
 impl LanceIndex {
-    /// Create a new Lance dataset at the given path.
+    /// Create a new Lance dataset at the given path (vector-only).
     pub fn create(db_path: &str, dimension: usize, metric: &str, table_name: &str) -> Result<Self> {
         let connection = runtime::block_on(lancedb::connect(db_path).execute())?;
 
-        let schema = Self::build_schema(dimension);
+        let schema = Self::build_vector_schema(dimension);
         let table_name = table_name.to_string();
 
         // Create empty table with schema (drop existing if present)
-        let empty_batch = Self::empty_batch(&schema, dimension)?;
+        let empty_batch = Self::empty_batch_from_schema(&schema)?;
         let batches = RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone());
-        // Try to drop existing table first (ignore errors if it doesn't exist)
         let _ = runtime::block_on(connection.drop_table(&table_name));
         let table = runtime::block_on(
             connection
@@ -56,17 +57,69 @@ impl LanceIndex {
         })
     }
 
-    /// Reopen an existing Lance dataset.
-    pub fn open(db_path: &str, dimension: usize, metric: &str, table_name: &str) -> Result<Self> {
+    /// Create a new Lance dataset from an Arrow schema (multi-column).
+    ///
+    /// The FFI schema describes the data columns (vector + extras).
+    /// A label column is prepended automatically.
+    ///
+    /// # Safety
+    /// Caller must pass a valid pointer to an Arrow C Data Interface ArrowSchema struct.
+    pub unsafe fn create_from_arrow(
+        db_path: &str,
+        ffi_schema_ptr: *mut FFI_ArrowSchema,
+        metric: &str,
+        table_name: &str,
+    ) -> Result<Self> {
+        // Import schema from FFI (borrows, does not consume)
+        let ffi_schema = &*ffi_schema_ptr;
+        let imported_schema = Schema::try_from(ffi_schema)
+            .map_err(|e| anyhow!("FFI schema import failed: {}", e))?;
+
+        // Find vector dimension from FixedSizeList column
+        let mut dimension = 0usize;
+        for field in imported_schema.fields() {
+            if let DataType::FixedSizeList(_, dim) = field.data_type() {
+                dimension = *dim as usize;
+                break;
+            }
+        }
+        if dimension == 0 {
+            return Err(anyhow!("no FixedSizeList column found in schema"));
+        }
+
+        // Build table schema: prepend label column, then imported fields
+        let mut table_fields: Vec<Arc<Field>> = vec![Arc::new(Field::new("label", DataType::Int64, false))];
+        for field in imported_schema.fields() {
+            // Rename vector column's child field to "item" (DuckDB uses "")
+            if let DataType::FixedSizeList(_, dim) = field.data_type() {
+                let fixed_field = Field::new(
+                    field.name(),
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        *dim,
+                    ),
+                    field.is_nullable(),
+                );
+                table_fields.push(Arc::new(fixed_field));
+            } else {
+                table_fields.push(Arc::new(field.as_ref().clone()));
+            }
+        }
+        let table_schema = Arc::new(Schema::new(table_fields));
+
+        // Create empty batch
+        let empty_batch = Self::empty_batch_from_schema(&table_schema)?;
+
+        // Create table
         let connection = runtime::block_on(lancedb::connect(db_path).execute())?;
         let table_name = table_name.to_string();
-        let table = runtime::block_on(connection.open_table(&table_name).execute())?;
-
-        let schema = Self::build_schema(dimension);
-
-        // Use MAX(label)+1, not count_rows() — count is wrong after deletes.
-        // e.g. insert [0,1,2,3,4], delete [1,2] → count=3 but label 3 exists.
-        let next_label = Self::query_max_label(&table)? + 1;
+        let _ = runtime::block_on(connection.drop_table(&table_name));
+        let batches = RecordBatchIterator::new(vec![Ok(empty_batch)], table_schema.clone());
+        let table = runtime::block_on(
+            connection
+                .create_table(&table_name, Box::new(batches))
+                .execute(),
+        )?;
 
         Ok(Self {
             connection,
@@ -74,9 +127,60 @@ impl LanceIndex {
             table_name,
             dimension,
             metric: metric.to_string(),
-            next_label: AtomicI64::new(next_label),
-            schema,
+            next_label: AtomicI64::new(0),
+            schema: table_schema,
         })
+    }
+
+    /// Reopen an existing Lance dataset, deriving schema from the table.
+    pub fn open(db_path: &str, table_name: &str, metric: &str) -> Result<Self> {
+        let connection = runtime::block_on(lancedb::connect(db_path).execute())?;
+        let table_name_str = table_name.to_string();
+        let table = runtime::block_on(connection.open_table(&table_name_str).execute())?;
+
+        // Derive schema from the Lance table
+        let table_schema = Self::read_table_schema(&table)?;
+
+        // Derive dimension from the vector column
+        let mut dimension = 0usize;
+        for field in table_schema.fields() {
+            if let DataType::FixedSizeList(_, dim) = field.data_type() {
+                dimension = *dim as usize;
+                break;
+            }
+        }
+        if dimension == 0 {
+            // Fallback: might be a vector-only table with known schema
+            return Err(anyhow!("cannot determine dimension from table schema"));
+        }
+
+        // Use MAX(label)+1, not count_rows() — count is wrong after deletes.
+        let next_label = Self::query_max_label(&table)? + 1;
+
+        Ok(Self {
+            connection,
+            table: Some(table),
+            table_name: table_name_str,
+            dimension,
+            metric: metric.to_string(),
+            next_label: AtomicI64::new(next_label),
+            schema: table_schema,
+        })
+    }
+
+    /// Read the schema from a Lance table via its metadata (no data query needed).
+    fn read_table_schema(table: &LanceTable) -> Result<Arc<Schema>> {
+        Ok(runtime::block_on(table.schema())?)
+    }
+
+    /// Whether this index has extra columns beyond label + vector.
+    pub fn has_extra_columns(&self) -> bool {
+        self.schema.fields().len() > 2
+    }
+
+    /// Get the table name.
+    pub fn table_name(&self) -> &str {
+        &self.table_name
     }
 
     /// Get the dimension of vectors in this index.
@@ -135,6 +239,155 @@ impl LanceIndex {
         runtime::block_on(table.add(Box::new(batches)).execute())?;
 
         Ok(labels)
+    }
+
+    /// Add a batch of rows via Arrow C Data Interface (multi-column path).
+    ///
+    /// The incoming Arrow struct has columns matching the table schema minus the label column.
+    /// Labels are auto-generated. Returns assigned labels.
+    ///
+    /// # Safety
+    /// Caller must pass valid pointers to Arrow C Data Interface structs.
+    pub unsafe fn add_batch_arrow(
+        &self,
+        ffi_schema_ptr: *mut FFI_ArrowSchema,
+        ffi_array_ptr: *mut FFI_ArrowArray,
+    ) -> Result<Vec<i64>> {
+        // Take ownership of the ArrowArray, leaving an empty one in C++ to prevent double-free
+        let ffi_array = std::mem::replace(&mut *ffi_array_ptr, FFI_ArrowArray::empty());
+        // Reference the schema (C++ still owns it and will release)
+        let ffi_schema_ref = &*ffi_schema_ptr;
+
+        // Import to Arrow arrays
+        let array_data = arrow::ffi::from_ffi(ffi_array, ffi_schema_ref)
+            .map_err(|e| anyhow!("Arrow FFI import failed: {}", e))?;
+        let struct_array = StructArray::from(array_data);
+        let num_rows = struct_array.len();
+
+        if num_rows == 0 {
+            return Ok(vec![]);
+        }
+
+        // Generate labels
+        let start_label = self.next_label.fetch_add(num_rows as i64, Ordering::Relaxed);
+        let labels: Vec<i64> = (start_label..start_label + num_rows as i64).collect();
+        let label_array = Int64Array::from(labels.clone());
+
+        // Build columns: [label, vector, extra1, extra2, ...]
+        // Use cast to match the table schema types (e.g., FixedSizeList child field name may differ)
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(1 + struct_array.num_columns());
+        columns.push(Arc::new(label_array));
+        for i in 0..struct_array.num_columns() {
+            let col = struct_array.column(i);
+            let target_type = self.schema.field(i + 1).data_type();
+            if col.data_type() == target_type {
+                columns.push(col.clone());
+            } else {
+                // Cast to match schema (handles FixedSizeList child field name differences)
+                let casted = cast(col.as_ref(), target_type)
+                    .map_err(|e| anyhow!("cast column {} failed: {}", i, e))?;
+                columns.push(casted);
+            }
+        }
+
+        let batch = RecordBatch::try_new(self.schema.clone(), columns)
+            .map_err(|e| anyhow!("RecordBatch schema mismatch: {}", e))?;
+
+        let table = self.get_table()?;
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], self.schema.clone());
+        runtime::block_on(table.add(Box::new(batches)).execute())?;
+
+        Ok(labels)
+    }
+
+    /// Merge live rows from source into self. All done in Rust, no extra FFI round-trip.
+    ///
+    /// `live_source_labels` are labels in the source that should be copied (not tombstoned).
+    /// Returns Vec<(old_label, new_label)> for the caller to update its mappings.
+    pub fn merge_from(
+        &self,
+        source: &LanceIndex,
+        live_source_labels: &[i64],
+    ) -> Result<Vec<(i64, i64)>> {
+        if live_source_labels.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let source_table = source.get_table()?;
+
+        // Build a predicate to select only the live labels
+        let csv: String = live_source_labels
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let predicate = format!("label IN ({})", csv);
+
+        let results = runtime::block_on(
+            source_table
+                .query()
+                .only_if(predicate)
+                .execute(),
+        )?;
+
+        // Collect all batches from source
+        let source_batches: Vec<RecordBatch> = runtime::block_on(async {
+            let mut batches = Vec::new();
+            let mut stream = results;
+            while let Some(batch) = stream
+                .try_next()
+                .await
+                .map_err(|e| anyhow!("stream error: {}", e))?
+            {
+                batches.push(batch);
+            }
+            Ok::<_, anyhow::Error>(batches)
+        })?;
+
+        let mut label_mapping = Vec::new();
+        let table = self.get_table()?;
+
+        for batch in &source_batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            // Extract old labels
+            let old_label_col = batch
+                .column_by_name("label")
+                .ok_or_else(|| anyhow!("missing label column in source"))?;
+            let old_labels = old_label_col
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow!("label column not Int64"))?;
+
+            // Generate new labels
+            let num_rows = batch.num_rows();
+            let start_label = self.next_label.fetch_add(num_rows as i64, Ordering::Relaxed);
+            let new_labels: Vec<i64> = (start_label..start_label + num_rows as i64).collect();
+            let new_label_array = Int64Array::from(new_labels.clone());
+
+            // Record old→new mapping
+            for i in 0..num_rows {
+                label_mapping.push((old_labels.value(i), new_labels[i]));
+            }
+
+            // Build new batch: replace label column with new labels, keep everything else
+            let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+            columns.push(Arc::new(new_label_array));
+            for i in 1..batch.num_columns() {
+                columns.push(batch.column(i).clone());
+            }
+
+            let new_batch = RecordBatch::try_new(self.schema.clone(), columns)
+                .map_err(|e| anyhow!("merge batch schema mismatch: {}", e))?;
+
+            let batches_iter =
+                RecordBatchIterator::new(vec![Ok(new_batch)], self.schema.clone());
+            runtime::block_on(table.add(Box::new(batches_iter)).execute())?;
+        }
+
+        Ok(label_mapping)
     }
 
     /// Search for k nearest neighbors.
@@ -403,25 +656,6 @@ impl LanceIndex {
         Ok((all_labels, all_vectors))
     }
 
-    /// Serialize metadata (not vector data — Lance handles that on disk).
-    pub fn serialize_meta(&self) -> Result<Vec<u8>> {
-        let meta = LanceMeta {
-            dimension: self.dimension,
-            metric: self.metric.clone(),
-            next_label: self.next_label.load(Ordering::Relaxed),
-            table_name: self.table_name.clone(),
-        };
-        Ok(serde_json::to_vec(&meta)?)
-    }
-
-    /// Deserialize metadata and reopen the Lance dataset.
-    pub fn deserialize_meta(db_path: &str, data: &[u8]) -> Result<Self> {
-        let meta: LanceMeta = serde_json::from_slice(data)?;
-        let mut index = Self::open(db_path, meta.dimension, &meta.metric, &meta.table_name)?;
-        index.next_label = AtomicI64::new(meta.next_label);
-        Ok(index)
-    }
-
     // Internal helpers
 
     /// Query MAX(label) from the table. Returns -1 if empty.
@@ -461,7 +695,8 @@ impl LanceIndex {
         Ok(max_label)
     }
 
-    fn build_schema(dimension: usize) -> Arc<Schema> {
+    /// Build schema for vector-only tables (label + vector).
+    fn build_vector_schema(dimension: usize) -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("label", DataType::Int64, false),
             Field::new(
@@ -475,20 +710,39 @@ impl LanceIndex {
         ]))
     }
 
+    /// Create an empty RecordBatch from a schema by generating empty arrays for each field.
+    fn empty_batch_from_schema(schema: &Arc<Schema>) -> Result<RecordBatch> {
+        let columns: Vec<ArrayRef> = schema
+            .fields()
+            .iter()
+            .map(|field| Self::empty_array_for_datatype(field.data_type()))
+            .collect();
+        Ok(RecordBatch::try_new(schema.clone(), columns)?)
+    }
+
+    /// Create an empty array for any Arrow DataType.
+    fn empty_array_for_datatype(dt: &DataType) -> ArrayRef {
+        use arrow_array::{BooleanArray, Int32Array, Float64Array, StringArray};
+        match dt {
+            DataType::Int64 => Arc::new(Int64Array::from(Vec::<i64>::new())),
+            DataType::Int32 => Arc::new(Int32Array::from(Vec::<i32>::new())),
+            DataType::Float32 => Arc::new(Float32Array::from(Vec::<f32>::new())),
+            DataType::Float64 => Arc::new(Float64Array::from(Vec::<f64>::new())),
+            DataType::Utf8 => Arc::new(StringArray::from(Vec::<&str>::new())),
+            DataType::Boolean => Arc::new(BooleanArray::from(Vec::<bool>::new())),
+            DataType::FixedSizeList(child_field, dim) => {
+                let values = Float32Array::from(Vec::<f32>::new());
+                let list = FixedSizeListArray::new(child_field.clone(), *dim, Arc::new(values), None);
+                Arc::new(list)
+            }
+            _ => Arc::new(StringArray::from(Vec::<&str>::new())), // fallback
+        }
+    }
+
     fn make_fixed_size_list(values: Float32Array, dimension: i32) -> FixedSizeListArray {
         let field = Arc::new(Field::new("item", DataType::Float32, true));
         let values_ref: ArrayRef = Arc::new(values);
         FixedSizeListArray::new(field, dimension, values_ref, None)
-    }
-
-    fn empty_batch(schema: &Arc<Schema>, dimension: usize) -> Result<RecordBatch> {
-        let labels = Int64Array::from(Vec::<i64>::new());
-        let values = Float32Array::from(Vec::<f32>::new());
-        let list = Self::make_fixed_size_list(values, dimension as i32);
-        Ok(RecordBatch::try_new(schema.clone(), vec![
-            Arc::new(labels),
-            Arc::new(list),
-        ])?)
     }
 
     /// Build a RecordBatch from already-contiguous flat vector data (no re-flattening needed).
@@ -512,14 +766,6 @@ impl LanceIndex {
             Arc::new(list),
         ])?)
     }
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct LanceMeta {
-    dimension: usize,
-    metric: String,
-    next_label: i64,
-    table_name: String,
 }
 
 #[cfg(test)]
@@ -549,7 +795,7 @@ mod tests {
 
         // Reopen — next insert must NOT produce label 3 (already exists)
         drop(idx);
-        let idx2 = LanceIndex::open(db_path_str, 3, "l2", "vectors").unwrap();
+        let idx2 = LanceIndex::open(db_path_str, "vectors", "l2").unwrap();
         let new_label = idx2.add_vector(&[99.0, 0.0, 0.0]).unwrap();
         assert!(
             new_label >= 5,
@@ -566,15 +812,15 @@ mod tests {
         let idx = LanceIndex::create(db_path_str, 2, "l2", "vectors").unwrap();
         drop(idx);
 
-        let idx2 = LanceIndex::open(db_path_str, 2, "l2", "vectors").unwrap();
+        let idx2 = LanceIndex::open(db_path_str, "vectors", "l2").unwrap();
         let label = idx2.add_vector(&[1.0, 2.0]).unwrap();
         assert_eq!(label, 0);
     }
 
     #[test]
-    fn test_deserialize_meta_preserves_next_label() {
+    fn test_open_derives_schema() {
         let dir = temp_dir();
-        let db_path = dir.path().join("test_meta.lance");
+        let db_path = dir.path().join("test_schema.lance");
         let db_path_str = db_path.to_str().unwrap();
 
         let idx = LanceIndex::create(db_path_str, 3, "l2", "vectors").unwrap();
@@ -584,14 +830,13 @@ mod tests {
         idx.delete(1).unwrap();
         idx.delete(2).unwrap();
 
-        let meta = idx.serialize_meta().unwrap();
         drop(idx);
 
-        let idx2 = LanceIndex::deserialize_meta(db_path_str, &meta).unwrap();
+        let idx2 = LanceIndex::open(db_path_str, "vectors", "l2").unwrap();
         let new_label = idx2.add_vector(&[99.0, 0.0, 0.0]).unwrap();
         assert!(
             new_label >= 5,
-            "expected label >= 5 via deserialize_meta, got {new_label}"
+            "expected label >= 5 via open, got {new_label}"
         );
     }
 
@@ -615,8 +860,8 @@ mod tests {
         // Reopen each — they stay independent
         drop(idx_a);
         drop(idx_b);
-        let idx_a2 = LanceIndex::open(db_path_str, 2, "l2", "idx_a").unwrap();
-        let idx_b2 = LanceIndex::open(db_path_str, 2, "l2", "idx_b").unwrap();
+        let idx_a2 = LanceIndex::open(db_path_str, "idx_a", "l2").unwrap();
+        let idx_b2 = LanceIndex::open(db_path_str, "idx_b", "l2").unwrap();
         assert_eq!(idx_a2.count().unwrap(), 2);
         assert_eq!(idx_b2.count().unwrap(), 1);
     }

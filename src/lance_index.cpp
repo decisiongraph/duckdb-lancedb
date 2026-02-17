@@ -18,6 +18,10 @@
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
+#include "duckdb/common/arrow/arrow.hpp"
+#include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/main/client_context.hpp"
+
 #include <cstring>
 #include <cstdlib>
 #include <unistd.h>
@@ -169,6 +173,14 @@ LanceIndex::LanceIndex(const string &name, IndexConstraintType constraint_type, 
 		}
 	}
 
+	// Detect extra columns from expressions beyond the first
+	for (idx_t i = 1; i < unbound_expressions.size(); i++) {
+		auto &expr = unbound_expressions[i];
+		extra_column_names_.push_back(expr->alias.empty() ? "extra_" + std::to_string(i - 1) : expr->alias);
+		extra_column_types_.push_back(expr->return_type);
+	}
+	has_extra_columns_ = !extra_column_names_.empty();
+
 	// Initialize block allocator
 	auto &block_manager = table_io_manager.GetIndexBlockManager();
 	block_allocator_ = make_uniq<FixedSizeAllocator>(LinkedBlock::BLOCK_SIZE, block_manager);
@@ -210,13 +222,27 @@ PhysicalOperator &LanceIndex::CreatePlan(PlanIndexInput &input) {
 	auto &op = input.op;
 	auto &planner = input.planner;
 
-	// Validate: single FLOAT[N] column
-	if (op.unbound_expressions.size() != 1) {
-		throw InvalidInputException("LANCE index requires exactly one column");
+	// Validate: first column must be FLOAT[N], additional columns are extra metadata
+	if (op.unbound_expressions.empty()) {
+		throw InvalidInputException("LANCE index requires at least one column");
 	}
 	auto &type = op.unbound_expressions[0]->return_type;
 	if (type.id() != LogicalTypeId::ARRAY || ArrayType::GetChildType(type).id() != LogicalTypeId::FLOAT) {
-		throw InvalidInputException("LANCE index column must be FLOAT[N]");
+		throw InvalidInputException("First LANCE index column must be FLOAT[N]");
+	}
+	// Validate extra column types
+	for (idx_t i = 1; i < op.unbound_expressions.size(); i++) {
+		auto &extra_type = op.unbound_expressions[i]->return_type;
+		switch (extra_type.id()) {
+		case LogicalTypeId::VARCHAR:
+		case LogicalTypeId::INTEGER:
+		case LogicalTypeId::BIGINT:
+		case LogicalTypeId::DOUBLE:
+		case LogicalTypeId::BOOLEAN:
+			break;
+		default:
+			throw InvalidInputException("Unsupported LANCE extra column type: " + extra_type.ToString());
+		}
 	}
 
 	// PROJECTION on indexed column + row_id
@@ -259,23 +285,89 @@ ErrorData LanceIndex::Append(IndexLock &lock, DataChunk &entries, Vector &row_id
 
 	if (!rust_handle_) {
 		auto lance_path = GetLancePath();
-		auto table_name = SanitizeIndexName(name);
-		rust_handle_ = LanceCreateDetached(lance_path, dimension_, metric_, table_name);
-	}
+		table_name_ = SanitizeIndexName(name);
+		if (has_extra_columns_) {
+			// Build ArrowSchema for multi-column table creation
+			vector<LogicalType> col_types;
+			vector<string> col_names;
+			col_names.push_back("vector");
+			col_types.push_back(expr_chunk.data[0].GetType());
+			for (idx_t i = 0; i < extra_column_names_.size(); i++) {
+				col_names.push_back(extra_column_names_[i]);
+				col_types.push_back(extra_column_types_[i]);
+			}
 
-	auto &vec_col = expr_chunk.data[0];
-	auto &array_child = ArrayVector::GetEntry(vec_col);
-	auto array_size = ArrayType::GetSize(vec_col.GetType());
-	auto child_data = FlatVector::GetData<float>(array_child);
+			ArrowSchema create_schema;
+			memset(&create_schema, 0, sizeof(ArrowSchema));
+			auto db_shared = db.GetDatabase().shared_from_this();
+			auto temp_ctx = make_shared_ptr<ClientContext>(db_shared);
+			auto client_props = temp_ctx->GetClientProperties();
+			ArrowConverter::ToArrowSchema(&create_schema, col_types, col_names, client_props);
+
+			rust_handle_ = LanceCreateDetachedFromArrow(lance_path, &create_schema, metric_, table_name_);
+
+			if (create_schema.release) {
+				create_schema.release(&create_schema);
+			}
+		} else {
+			rust_handle_ = LanceCreateDetached(lance_path, dimension_, metric_, table_name_);
+		}
+	}
 
 	UnifiedVectorFormat rowid_format;
 	row_identifiers.ToUnifiedFormat(count, rowid_format);
 	auto rowid_data = reinterpret_cast<row_t *>(rowid_format.data);
 
 	vector<int64_t> labels(count);
-	auto n = LanceDetachedAddBatch(rust_handle_, child_data,
-	                               static_cast<int32_t>(count),
-	                               dimension_, labels.data());
+	int32_t n;
+
+	if (has_extra_columns_) {
+		// Arrow C Data Interface path: zero-copy via ArrowConverter with temp ClientContext
+		idx_t data_col_count = expr_chunk.ColumnCount();
+		vector<LogicalType> arrow_types;
+		vector<string> col_names;
+		col_names.push_back("vector");
+		arrow_types.push_back(expr_chunk.data[0].GetType());
+		for (idx_t i = 0; i < extra_column_names_.size(); i++) {
+			col_names.push_back(extra_column_names_[i]);
+			arrow_types.push_back(expr_chunk.data[i + 1].GetType());
+		}
+
+		DataChunk arrow_chunk;
+		arrow_chunk.Initialize(Allocator::DefaultAllocator(), arrow_types);
+		for (idx_t i = 0; i < arrow_types.size(); i++) {
+			arrow_chunk.data[i].Reference(expr_chunk.data[i]);
+		}
+		arrow_chunk.SetCardinality(count);
+
+		ArrowSchema arrow_schema;
+		ArrowArray arrow_array;
+		memset(&arrow_schema, 0, sizeof(ArrowSchema));
+		memset(&arrow_array, 0, sizeof(ArrowArray));
+
+		// Create temporary ClientContext for Arrow conversion (BoundIndex::Append has no ClientContext)
+		auto db_shared = db.GetDatabase().shared_from_this();
+		auto temp_ctx = make_shared_ptr<ClientContext>(db_shared);
+		auto client_props = temp_ctx->GetClientProperties();
+
+		ArrowConverter::ToArrowSchema(&arrow_schema, arrow_types, col_names, client_props);
+		unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> ext_types;
+		ArrowConverter::ToArrowArray(arrow_chunk, &arrow_array, client_props, ext_types);
+
+		n = LanceDetachedAddBatchArrow(rust_handle_, &arrow_schema, &arrow_array, labels.data());
+
+		// Release schema (Rust consumed the array)
+		if (arrow_schema.release) {
+			arrow_schema.release(&arrow_schema);
+		}
+	} else {
+		// Vector-only fast path
+		auto &vec_col = expr_chunk.data[0];
+		auto &array_child = ArrayVector::GetEntry(vec_col);
+		auto child_data = FlatVector::GetData<float>(array_child);
+
+		n = LanceDetachedAddBatch(rust_handle_, child_data, static_cast<int32_t>(count), dimension_, labels.data());
+	}
 
 	for (idx_t i = 0; i < static_cast<idx_t>(n); i++) {
 		auto row_idx = rowid_format.sel->get_index(i);
@@ -402,16 +494,14 @@ void LanceIndex::PersistToDisk() {
 		root_block_ptr_ = block_allocator_->New();
 	}
 
-	// Serialize Lance metadata
-	auto meta = LanceDetachedSerializeMeta(rust_handle_);
-
 	LinkedBlockWriter writer(*block_allocator_, root_block_ptr_);
 	writer.Reset();
 
-	// Write Lance metadata
-	uint64_t meta_len = meta.len;
-	writer.Write(reinterpret_cast<const uint8_t *>(&meta_len), sizeof(uint64_t));
-	writer.Write(meta.data, meta.len);
+	// Write table_name
+	auto table_name = table_name_.empty() ? SanitizeIndexName(name) : table_name_;
+	uint32_t table_name_len = static_cast<uint32_t>(table_name.size());
+	writer.Write(reinterpret_cast<const uint8_t *>(&table_name_len), sizeof(uint32_t));
+	writer.Write(reinterpret_cast<const uint8_t *>(table_name.data()), table_name_len);
 
 	// Write label → row_id mappings
 	uint64_t num_mappings = label_to_rowid_.size();
@@ -419,12 +509,6 @@ void LanceIndex::PersistToDisk() {
 	if (num_mappings > 0) {
 		writer.Write(reinterpret_cast<const uint8_t *>(label_to_rowid_.data()), num_mappings * sizeof(row_t));
 	}
-
-	// Tombstone section: write 0 for format compatibility.
-	// Deleted labels are tracked via sentinel (-1) in label_to_rowid_ above;
-	// Lance handles delete filtering natively.
-	uint64_t num_tombstones = 0;
-	writer.Write(reinterpret_cast<const uint8_t *>(&num_tombstones), sizeof(uint64_t));
 
 	// Write parameters
 	writer.Write(reinterpret_cast<const uint8_t *>(&dimension_), sizeof(int32_t));
@@ -440,7 +524,6 @@ void LanceIndex::PersistToDisk() {
 	writer.Write(reinterpret_cast<const uint8_t *>(&path_len), sizeof(uint32_t));
 	writer.Write(reinterpret_cast<const uint8_t *>(lance_path.data()), path_len);
 
-	LanceFreeBytes(meta);
 	is_dirty_ = false;
 }
 
@@ -454,12 +537,12 @@ void LanceIndex::LoadFromStorage(const IndexStorageInfo &info) {
 
 	LinkedBlockReader reader(*block_allocator_, root_block_ptr_);
 
-	// Read Lance metadata
-	uint64_t meta_len = 0;
-	reader.Read(reinterpret_cast<uint8_t *>(&meta_len), sizeof(uint64_t));
-
-	vector<uint8_t> meta_data(meta_len);
-	reader.Read(meta_data.data(), meta_len);
+	// Read table_name
+	uint32_t table_name_len = 0;
+	reader.Read(reinterpret_cast<uint8_t *>(&table_name_len), sizeof(uint32_t));
+	vector<char> table_name_buf(table_name_len);
+	reader.Read(reinterpret_cast<uint8_t *>(table_name_buf.data()), table_name_len);
+	table_name_.assign(table_name_buf.data(), table_name_len);
 
 	// Read label → row_id mappings
 	uint64_t num_mappings = 0;
@@ -467,20 +550,6 @@ void LanceIndex::LoadFromStorage(const IndexStorageInfo &info) {
 	label_to_rowid_.resize(num_mappings);
 	if (num_mappings > 0) {
 		reader.Read(reinterpret_cast<uint8_t *>(label_to_rowid_.data()), num_mappings * sizeof(row_t));
-	}
-
-	// Read legacy tombstones (for backward compat with old persisted indexes).
-	// Apply them as sentinel values in label_to_rowid_ instead.
-	uint64_t num_tombstones = 0;
-	reader.Read(reinterpret_cast<uint8_t *>(&num_tombstones), sizeof(uint64_t));
-	if (num_tombstones > 0) {
-		vector<int64_t> tombstones(num_tombstones);
-		reader.Read(reinterpret_cast<uint8_t *>(tombstones.data()), num_tombstones * sizeof(int64_t));
-		for (auto label : tombstones) {
-			if (label >= 0 && static_cast<idx_t>(label) < label_to_rowid_.size()) {
-				label_to_rowid_[label] = static_cast<row_t>(-1);
-			}
-		}
 	}
 
 	// Read parameters
@@ -498,7 +567,7 @@ void LanceIndex::LoadFromStorage(const IndexStorageInfo &info) {
 	reader.Read(reinterpret_cast<uint8_t *>(&path_len), sizeof(uint32_t));
 	vector<char> path_buf(path_len);
 	reader.Read(reinterpret_cast<uint8_t *>(path_buf.data()), path_len);
-	string lance_path(path_buf.data(), path_len);
+	lance_path_.assign(path_buf.data(), path_len);
 
 	// Rebuild reverse mappings (skip deleted/unassigned slots marked as -1)
 	for (size_t i = 0; i < label_to_rowid_.size(); i++) {
@@ -507,8 +576,9 @@ void LanceIndex::LoadFromStorage(const IndexStorageInfo &info) {
 		}
 	}
 
-	// Reopen Lance dataset
-	rust_handle_ = LanceDetachedDeserializeMeta(lance_path, meta_data.data(), meta_data.size());
+	// Reopen Lance dataset from on-disk path (schema derived from the Lance table itself)
+	rust_handle_ = LanceOpenDetached(lance_path_, table_name_, metric_);
+	has_extra_columns_ = LanceDetachedHasExtraColumns(rust_handle_);
 	is_dirty_ = false;
 }
 
@@ -554,53 +624,96 @@ bool LanceIndex::MergeIndexes(IndexLock &state, BoundIndex &other_index) {
 		return true;
 	}
 
-	// Bulk export all vectors from other index in a single FFI call
-	int64_t other_vec_count = 0;
-	LanceDetachedGetAllVectors(other.rust_handle_, nullptr, nullptr, &other_vec_count);
-
-	if (other_vec_count <= 0) {
-		is_dirty_ = true;
-		return true;
-	}
-
-	vector<int64_t> other_labels(other_vec_count);
-	vector<float> other_vectors(other_vec_count * dimension_);
-	LanceDetachedGetAllVectors(other.rust_handle_, other_labels.data(), other_vectors.data(), &other_vec_count);
-
-	// Filter out tombstoned vectors and collect live ones
-	vector<float> live_vectors;
-	vector<row_t> live_rowids;
-
-	for (int64_t i = 0; i < other_vec_count; i++) {
-		auto label = other_labels[i];
-		if (label < 0 || label >= static_cast<int64_t>(other.label_to_rowid_.size())) {
-			continue;
-		}
-		if (other.label_to_rowid_[label] == static_cast<row_t>(-1)) {
-			continue;
-		}
-
-		auto vec_start = i * dimension_;
-		live_vectors.insert(live_vectors.end(), other_vectors.begin() + vec_start,
-		                    other_vectors.begin() + vec_start + dimension_);
-		live_rowids.push_back(other.label_to_rowid_[label]);
-	}
-
-	// Single batch insert
-	if (!live_rowids.empty()) {
-		auto num = static_cast<int32_t>(live_rowids.size());
-		vector<int64_t> new_labels(num);
-		LanceDetachedAddBatch(rust_handle_, live_vectors.data(), num, dimension_, new_labels.data());
-
-		for (idx_t i = 0; i < static_cast<idx_t>(num); i++) {
-			auto row_id = live_rowids[i];
-			auto label = new_labels[i];
-
-			if (static_cast<idx_t>(label) >= label_to_rowid_.size()) {
-				label_to_rowid_.resize(label + 1, -1);
+	if (has_extra_columns_) {
+		// Multi-column path: use Rust-side merge (queries source, re-labels, inserts into target)
+		// Collect live labels from other index
+		vector<int64_t> live_labels;
+		vector<row_t> live_rowids;
+		for (idx_t i = 0; i < other.label_to_rowid_.size(); i++) {
+			if (other.label_to_rowid_[i] != static_cast<row_t>(-1)) {
+				live_labels.push_back(static_cast<int64_t>(i));
+				live_rowids.push_back(other.label_to_rowid_[i]);
 			}
-			label_to_rowid_[label] = row_id;
-			rowid_to_label_[row_id] = label;
+		}
+
+		if (!live_labels.empty()) {
+			auto count = static_cast<int32_t>(live_labels.size());
+			vector<int64_t> out_old_labels(count);
+			vector<int64_t> out_new_labels(count);
+			auto n = LanceDetachedMerge(rust_handle_, other.rust_handle_, live_labels.data(), count,
+			                            out_old_labels.data(), out_new_labels.data());
+
+			// Build old_label→rowid map from the other index for lookup
+			unordered_map<int64_t, row_t> old_label_to_rowid;
+			for (idx_t i = 0; i < live_labels.size(); i++) {
+				old_label_to_rowid[live_labels[i]] = live_rowids[i];
+			}
+
+			for (int32_t i = 0; i < n; i++) {
+				auto old_label = out_old_labels[i];
+				auto new_label = out_new_labels[i];
+				auto it = old_label_to_rowid.find(old_label);
+				if (it == old_label_to_rowid.end()) {
+					continue;
+				}
+				auto row_id = it->second;
+
+				if (static_cast<idx_t>(new_label) >= label_to_rowid_.size()) {
+					label_to_rowid_.resize(new_label + 1, -1);
+				}
+				label_to_rowid_[new_label] = row_id;
+				rowid_to_label_[row_id] = new_label;
+			}
+		}
+	} else {
+		// Vector-only path: bulk export + re-insert
+		int64_t other_vec_count = 0;
+		LanceDetachedGetAllVectors(other.rust_handle_, nullptr, nullptr, &other_vec_count);
+
+		if (other_vec_count <= 0) {
+			is_dirty_ = true;
+			return true;
+		}
+
+		vector<int64_t> other_labels(other_vec_count);
+		vector<float> other_vectors(other_vec_count * dimension_);
+		LanceDetachedGetAllVectors(other.rust_handle_, other_labels.data(), other_vectors.data(), &other_vec_count);
+
+		// Filter out tombstoned vectors and collect live ones
+		vector<float> live_vectors;
+		vector<row_t> live_rowids;
+
+		for (int64_t i = 0; i < other_vec_count; i++) {
+			auto label = other_labels[i];
+			if (label < 0 || label >= static_cast<int64_t>(other.label_to_rowid_.size())) {
+				continue;
+			}
+			if (other.label_to_rowid_[label] == static_cast<row_t>(-1)) {
+				continue;
+			}
+
+			auto vec_start = i * dimension_;
+			live_vectors.insert(live_vectors.end(), other_vectors.begin() + vec_start,
+			                    other_vectors.begin() + vec_start + dimension_);
+			live_rowids.push_back(other.label_to_rowid_[label]);
+		}
+
+		// Single batch insert
+		if (!live_rowids.empty()) {
+			auto num = static_cast<int32_t>(live_rowids.size());
+			vector<int64_t> new_labels(num);
+			LanceDetachedAddBatch(rust_handle_, live_vectors.data(), num, dimension_, new_labels.data());
+
+			for (idx_t i = 0; i < static_cast<idx_t>(num); i++) {
+				auto row_id = live_rowids[i];
+				auto label = new_labels[i];
+
+				if (static_cast<idx_t>(label) >= label_to_rowid_.size()) {
+					label_to_rowid_.resize(label + 1, -1);
+				}
+				label_to_rowid_[label] = row_id;
+				rowid_to_label_[row_id] = label;
+			}
 		}
 	}
 
@@ -648,6 +761,12 @@ struct CreateLanceGlobalSinkState : public GlobalSinkState {
 	int32_t nprobes = 20;
 	int32_t refine_factor = 1;
 	string lance_path;
+	string table_name;
+
+	// Extra columns
+	vector<string> extra_column_names;
+	vector<LogicalType> extra_column_types;
+	bool has_extra_columns = false;
 
 	~CreateLanceGlobalSinkState() override {
 		if (rust_handle) {
@@ -687,6 +806,14 @@ unique_ptr<GlobalSinkState> PhysicalCreateLanceIndex::GetGlobalSinkState(ClientC
 		}
 	}
 
+	// Detect extra columns from unbound_expressions[1..]
+	for (idx_t i = 1; i < unbound_expressions.size(); i++) {
+		auto &expr = unbound_expressions[i];
+		state->extra_column_names.push_back(expr->alias.empty() ? "extra_" + std::to_string(i - 1) : expr->alias);
+		state->extra_column_types.push_back(expr->return_type);
+	}
+	state->has_extra_columns = !state->extra_column_names.empty();
+
 	// Determine Lance path
 	auto sanitized = SanitizeIndexName(info->index_name);
 	auto &storage = table.GetStorage();
@@ -705,7 +832,33 @@ unique_ptr<GlobalSinkState> PhysicalCreateLanceIndex::GetGlobalSinkState(ClientC
 		fs.CreateDirectory(parent);
 	}
 
-	state->rust_handle = LanceCreateDetached(state->lance_path, state->dimension, state->metric, sanitized);
+	state->table_name = sanitized;
+
+	if (state->has_extra_columns) {
+		// Build ArrowSchema for multi-column table creation
+		vector<LogicalType> col_types;
+		vector<string> col_names;
+		col_names.push_back("vector");
+		col_types.push_back(unbound_expressions[0]->return_type);
+		for (idx_t i = 0; i < state->extra_column_names.size(); i++) {
+			col_names.push_back(state->extra_column_names[i]);
+			col_types.push_back(state->extra_column_types[i]);
+		}
+
+		ArrowSchema create_schema;
+		memset(&create_schema, 0, sizeof(ArrowSchema));
+		auto client_props = context.GetClientProperties();
+		ArrowConverter::ToArrowSchema(&create_schema, col_types, col_names, client_props);
+
+		state->rust_handle =
+		    LanceCreateDetachedFromArrow(state->lance_path, &create_schema, state->metric, sanitized);
+
+		if (create_schema.release) {
+			create_schema.release(&create_schema);
+		}
+	} else {
+		state->rust_handle = LanceCreateDetached(state->lance_path, state->dimension, state->metric, sanitized);
+	}
 	return std::move(state);
 }
 
@@ -716,7 +869,6 @@ SinkResultType PhysicalCreateLanceIndex::Sink(ExecutionContext &context, DataChu
 	auto col_count = chunk.ColumnCount();
 	D_ASSERT(col_count >= 2);
 
-	auto &vec_col = chunk.data[0];
 	auto &rowid_col = chunk.data[col_count - 1];
 
 	auto count = chunk.size();
@@ -724,18 +876,57 @@ SinkResultType PhysicalCreateLanceIndex::Sink(ExecutionContext &context, DataChu
 		return SinkResultType::NEED_MORE_INPUT;
 	}
 
-	auto &array_child = ArrayVector::GetEntry(vec_col);
-	auto array_size = ArrayType::GetSize(vec_col.GetType());
-	auto child_data = FlatVector::GetData<float>(array_child);
-
 	UnifiedVectorFormat rowid_format;
 	rowid_col.ToUnifiedFormat(count, rowid_format);
 	auto rowid_data = reinterpret_cast<row_t *>(rowid_format.data);
 
 	vector<int64_t> labels(count);
-	auto n = LanceDetachedAddBatch(state.rust_handle, child_data,
-	                               static_cast<int32_t>(count),
-	                               state.dimension, labels.data());
+	int32_t n;
+
+	if (state.has_extra_columns) {
+		// Arrow FFI path: convert all indexed columns (excluding rowid) to Arrow
+		idx_t data_col_count = col_count - 1; // exclude rowid
+		vector<LogicalType> arrow_types;
+		vector<string> col_names;
+		col_names.push_back("vector");
+		arrow_types.push_back(chunk.data[0].GetType());
+		for (idx_t i = 0; i < state.extra_column_names.size(); i++) {
+			col_names.push_back(state.extra_column_names[i]);
+			arrow_types.push_back(chunk.data[i + 1].GetType());
+		}
+
+		DataChunk arrow_chunk;
+		arrow_chunk.Initialize(Allocator::DefaultAllocator(), arrow_types);
+		for (idx_t i = 0; i < data_col_count; i++) {
+			arrow_chunk.data[i].Reference(chunk.data[i]);
+		}
+		arrow_chunk.SetCardinality(count);
+
+		ArrowSchema arrow_schema;
+		ArrowArray arrow_array;
+		memset(&arrow_schema, 0, sizeof(ArrowSchema));
+		memset(&arrow_array, 0, sizeof(ArrowArray));
+
+		auto client_props = context.client.GetClientProperties();
+		ArrowConverter::ToArrowSchema(&arrow_schema, arrow_types, col_names, client_props);
+		unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> ext_types;
+		ArrowConverter::ToArrowArray(arrow_chunk, &arrow_array, client_props, ext_types);
+
+		n = LanceDetachedAddBatchArrow(state.rust_handle, &arrow_schema, &arrow_array, labels.data());
+
+		// Release schema (Rust consumed the array)
+		if (arrow_schema.release) {
+			arrow_schema.release(&arrow_schema);
+		}
+	} else {
+		// Vector-only fast path
+		auto &vec_col = chunk.data[0];
+		auto &array_child = ArrayVector::GetEntry(vec_col);
+		auto child_data = FlatVector::GetData<float>(array_child);
+
+		n = LanceDetachedAddBatch(state.rust_handle, child_data, static_cast<int32_t>(count), state.dimension,
+		                          labels.data());
+	}
 
 	for (idx_t i = 0; i < static_cast<idx_t>(n); i++) {
 		auto row_idx = rowid_format.sel->get_index(i);
@@ -772,6 +963,8 @@ SinkFinalizeType PhysicalCreateLanceIndex::Finalize(Pipeline &pipeline, Event &e
 	index->refine_factor_ = state.refine_factor;
 	index->label_to_rowid_ = std::move(state.label_to_rowid);
 	index->rowid_to_label_ = std::move(state.rowid_to_label);
+	index->table_name_ = std::move(state.table_name);
+	index->lance_path_ = std::move(state.lance_path);
 	index->is_dirty_ = true;
 
 	auto &schema = table.schema;

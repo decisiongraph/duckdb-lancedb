@@ -6,18 +6,23 @@
 
 extern "C" {
 
-struct LanceBytesFFI {
-	uint8_t *data;
-	size_t len;
-	size_t capacity;
-};
-
 void *lance_create_detached(const char *db_path, int32_t dimension, const char *metric, const char *table_name,
                             char *err_buf, int err_buf_len);
+void *lance_create_detached_from_arrow(const char *db_path, void *arrow_schema, const char *metric,
+                                       const char *table_name, char *err_buf, int err_buf_len);
+void *lance_open_detached(const char *db_path, const char *table_name, const char *metric, char *err_buf,
+                          int err_buf_len);
 void lance_free_detached(void *handle);
+int32_t lance_detached_has_extra_columns(void *handle);
+int32_t lance_detached_dimension(void *handle);
 int64_t lance_detached_add(void *handle, const float *vector, int32_t dimension, char *err_buf, int err_buf_len);
 int32_t lance_detached_add_batch(void *handle, const float *vectors, int32_t num, int32_t dim, int64_t *out_labels,
                                  char *err_buf, int err_buf_len);
+int32_t lance_detached_add_batch_arrow(void *handle, void *arrow_schema, void *arrow_array, int64_t *out_labels,
+                                       char *err_buf, int err_buf_len);
+int32_t lance_detached_merge(void *target_handle, void *source_handle, const int64_t *live_source_labels,
+                             int32_t live_count, int64_t *out_old_labels, int64_t *out_new_labels, char *err_buf,
+                             int err_buf_len);
 int32_t lance_detached_search(void *handle, const float *query, int32_t dim, int32_t k, int32_t nprobes,
                               int32_t refine_factor, int64_t *out_labels, float *out_distances, char *err_buf,
                               int err_buf_len);
@@ -34,10 +39,6 @@ int32_t lance_detached_get_vector(void *handle, int64_t label, float *out_vec, i
                                   int err_buf_len);
 int32_t lance_detached_get_all_vectors(void *handle, int64_t *out_labels, float *out_vectors, int64_t *out_count,
                                        char *err_buf, int err_buf_len);
-LanceBytesFFI lance_detached_serialize_meta(void *handle, char *err_buf, int err_buf_len);
-void *lance_detached_deserialize_meta(const char *db_path, const uint8_t *data, size_t len, char *err_buf,
-                                      int err_buf_len);
-void lance_free_bytes(LanceBytesFFI bytes);
 }
 
 namespace duckdb {
@@ -55,8 +56,36 @@ LanceHandle LanceCreateDetached(const std::string &db_path, int32_t dimension, c
 	return handle;
 }
 
+LanceHandle LanceCreateDetachedFromArrow(const std::string &db_path, void *arrow_schema, const std::string &metric,
+                                         const std::string &table_name) {
+	char err_buf[ERR_BUF_LEN] = {0};
+	auto handle = lance_create_detached_from_arrow(db_path.c_str(), arrow_schema, metric.c_str(), table_name.c_str(),
+	                                               err_buf, ERR_BUF_LEN);
+	if (!handle) {
+		throw IOException("Lance create_from_arrow: " + std::string(err_buf));
+	}
+	return handle;
+}
+
+LanceHandle LanceOpenDetached(const std::string &db_path, const std::string &table_name, const std::string &metric) {
+	char err_buf[ERR_BUF_LEN] = {0};
+	auto handle = lance_open_detached(db_path.c_str(), table_name.c_str(), metric.c_str(), err_buf, ERR_BUF_LEN);
+	if (!handle) {
+		throw IOException("Lance open: " + std::string(err_buf));
+	}
+	return handle;
+}
+
 void LanceFreeDetached(LanceHandle handle) {
 	lance_free_detached(handle);
+}
+
+bool LanceDetachedHasExtraColumns(LanceHandle handle) {
+	return lance_detached_has_extra_columns(handle) != 0;
+}
+
+int32_t LanceDetachedDimension(LanceHandle handle) {
+	return lance_detached_dimension(handle);
 }
 
 int64_t LanceDetachedAdd(LanceHandle handle, const float *vector, int32_t dimension) {
@@ -74,6 +103,26 @@ int32_t LanceDetachedAddBatch(LanceHandle handle, const float *vectors, int32_t 
 	int32_t n = lance_detached_add_batch(handle, vectors, num, dim, out_labels, err_buf, ERR_BUF_LEN);
 	if (n < 0) {
 		throw IOException("Lance add_batch: " + std::string(err_buf));
+	}
+	return n;
+}
+
+int32_t LanceDetachedAddBatchArrow(LanceHandle handle, void *arrow_schema, void *arrow_array, int64_t *out_labels) {
+	char err_buf[ERR_BUF_LEN] = {0};
+	int32_t n = lance_detached_add_batch_arrow(handle, arrow_schema, arrow_array, out_labels, err_buf, ERR_BUF_LEN);
+	if (n < 0) {
+		throw IOException("Lance add_batch_arrow: " + std::string(err_buf));
+	}
+	return n;
+}
+
+int32_t LanceDetachedMerge(LanceHandle target, LanceHandle source, const int64_t *live_source_labels,
+                           int32_t live_count, int64_t *out_old_labels, int64_t *out_new_labels) {
+	char err_buf[ERR_BUF_LEN] = {0};
+	int32_t n = lance_detached_merge(target, source, live_source_labels, live_count, out_old_labels, out_new_labels,
+	                                 err_buf, ERR_BUF_LEN);
+	if (n < 0) {
+		throw IOException("Lance merge: " + std::string(err_buf));
 	}
 	return n;
 }
@@ -154,29 +203,6 @@ int32_t LanceDetachedGetAllVectors(LanceHandle handle, int64_t *out_labels, floa
 		throw IOException("Lance get_all_vectors: " + std::string(err_buf));
 	}
 	return n;
-}
-
-LanceSerializedMeta LanceDetachedSerializeMeta(LanceHandle handle) {
-	char err_buf[ERR_BUF_LEN] = {0};
-	auto result = lance_detached_serialize_meta(handle, err_buf, ERR_BUF_LEN);
-	if (!result.data) {
-		throw IOException("Lance serialize_meta: " + std::string(err_buf));
-	}
-	return {result.data, result.len, result.capacity};
-}
-
-LanceHandle LanceDetachedDeserializeMeta(const std::string &db_path, const uint8_t *data, size_t len) {
-	char err_buf[ERR_BUF_LEN] = {0};
-	auto handle = lance_detached_deserialize_meta(db_path.c_str(), data, len, err_buf, ERR_BUF_LEN);
-	if (!handle) {
-		throw IOException("Lance deserialize_meta: " + std::string(err_buf));
-	}
-	return handle;
-}
-
-void LanceFreeBytes(LanceSerializedMeta bytes) {
-	LanceBytesFFI raw = {bytes.data, bytes.len, bytes.capacity};
-	lance_free_bytes(raw);
 }
 
 } // namespace duckdb

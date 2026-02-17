@@ -3172,12 +3172,11 @@ name = "lancedb_rust"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arrow",
  "arrow-array",
  "arrow-schema",
  "futures-util",
  "lancedb",
- "serde",
- "serde_json",
  "tempfile",
  "tokio",
 ]

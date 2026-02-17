@@ -3,16 +3,10 @@
 use std::ffi::{CStr, c_char, c_void};
 use std::slice;
 
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use crate::lance_manager::LanceIndex;
 
 pub type LanceHandlePtr = *mut c_void;
-
-#[repr(C)]
-pub struct LanceBytes {
-    pub data: *mut u8,
-    pub len: usize,
-    pub capacity: usize,
-}
 
 // ========================================
 // Helpers
@@ -37,7 +31,7 @@ unsafe fn c_str_to_string(ptr: *const c_char) -> String {
 }
 
 // ========================================
-// Create / Free
+// Create / Open / Free
 // ========================================
 
 #[no_mangle]
@@ -62,10 +56,168 @@ pub unsafe extern "C" fn lance_create_detached(
     }
 }
 
+/// Create a Lance dataset from an Arrow schema (multi-column, zero-copy).
+/// `arrow_schema` is a pointer to an ArrowSchema struct describing the data columns
+/// (vector + extras). A label column is prepended automatically.
+#[no_mangle]
+pub unsafe extern "C" fn lance_create_detached_from_arrow(
+    db_path: *const c_char,
+    arrow_schema: *mut c_void,
+    metric: *const c_char,
+    table_name: *const c_char,
+    err_buf: *mut c_char,
+    err_buf_len: i32,
+) -> LanceHandlePtr {
+    let db_path_str = c_str_to_string(db_path);
+    let metric_str = c_str_to_string(metric);
+    let table_name_str = c_str_to_string(table_name);
+
+    if arrow_schema.is_null() {
+        write_err(err_buf, err_buf_len, "null arrow schema");
+        return std::ptr::null_mut();
+    }
+
+    let schema_ptr = arrow_schema as *mut FFI_ArrowSchema;
+
+    match LanceIndex::create_from_arrow(&db_path_str, schema_ptr, &metric_str, &table_name_str) {
+        Ok(index) => Box::into_raw(Box::new(index)) as LanceHandlePtr,
+        Err(e) => {
+            write_err(err_buf, err_buf_len, &format!("create_from_arrow failed: {}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Open an existing Lance dataset, deriving schema from the table.
+#[no_mangle]
+pub unsafe extern "C" fn lance_open_detached(
+    db_path: *const c_char,
+    table_name: *const c_char,
+    metric: *const c_char,
+    err_buf: *mut c_char,
+    err_buf_len: i32,
+) -> LanceHandlePtr {
+    let db_path_str = c_str_to_string(db_path);
+    let table_name_str = c_str_to_string(table_name);
+    let metric_str = c_str_to_string(metric);
+
+    match LanceIndex::open(&db_path_str, &table_name_str, &metric_str) {
+        Ok(index) => Box::into_raw(Box::new(index)) as LanceHandlePtr,
+        Err(e) => {
+            write_err(err_buf, err_buf_len, &format!("open failed: {}", e));
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Check if the index has extra columns beyond label + vector.
+#[no_mangle]
+pub unsafe extern "C" fn lance_detached_has_extra_columns(
+    handle: LanceHandlePtr,
+) -> i32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let h = &*(handle as *mut LanceIndex);
+    if h.has_extra_columns() { 1 } else { 0 }
+}
+
+/// Get the dimension of vectors in the index.
+#[no_mangle]
+pub unsafe extern "C" fn lance_detached_dimension(
+    handle: LanceHandlePtr,
+) -> i32 {
+    if handle.is_null() {
+        return 0;
+    }
+    let h = &*(handle as *mut LanceIndex);
+    h.dimension() as i32
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lance_free_detached(handle: LanceHandlePtr) {
     if !handle.is_null() {
         drop(Box::from_raw(handle as *mut LanceIndex));
+    }
+}
+
+/// Add a batch of rows via Arrow C Data Interface.
+/// `arrow_schema` and `arrow_array` are pointers to ArrowSchema/ArrowArray structs.
+/// Fills `out_labels` with assigned labels. Returns count or -1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn lance_detached_add_batch_arrow(
+    handle: LanceHandlePtr,
+    arrow_schema: *mut c_void,
+    arrow_array: *mut c_void,
+    out_labels: *mut i64,
+    err_buf: *mut c_char,
+    err_buf_len: i32,
+) -> i32 {
+    if handle.is_null() {
+        write_err(err_buf, err_buf_len, "null handle");
+        return -1;
+    }
+    if arrow_schema.is_null() || arrow_array.is_null() {
+        write_err(err_buf, err_buf_len, "null arrow schema/array");
+        return -1;
+    }
+    let h = &*(handle as *mut LanceIndex);
+    let schema_ptr = arrow_schema as *mut FFI_ArrowSchema;
+    let array_ptr = arrow_array as *mut FFI_ArrowArray;
+
+    match h.add_batch_arrow(schema_ptr, array_ptr) {
+        Ok(labels) => {
+            for (i, label) in labels.iter().enumerate() {
+                *out_labels.add(i) = *label;
+            }
+            labels.len() as i32
+        }
+        Err(e) => {
+            write_err(err_buf, err_buf_len, &format!("add_batch_arrow failed: {}", e));
+            -1
+        }
+    }
+}
+
+/// Merge live rows from source index into target index (all in Rust).
+/// `live_source_labels` are the labels in source that are not tombstoned.
+/// Fills `out_old_labels` and `out_new_labels` with the mapping.
+/// Returns count of merged rows or -1 on error.
+#[no_mangle]
+pub unsafe extern "C" fn lance_detached_merge(
+    target_handle: LanceHandlePtr,
+    source_handle: LanceHandlePtr,
+    live_source_labels: *const i64,
+    live_count: i32,
+    out_old_labels: *mut i64,
+    out_new_labels: *mut i64,
+    err_buf: *mut c_char,
+    err_buf_len: i32,
+) -> i32 {
+    if target_handle.is_null() || source_handle.is_null() {
+        write_err(err_buf, err_buf_len, "null handle");
+        return -1;
+    }
+    let target = &*(target_handle as *mut LanceIndex);
+    let source = &*(source_handle as *mut LanceIndex);
+    let live_labels = if live_count > 0 && !live_source_labels.is_null() {
+        slice::from_raw_parts(live_source_labels, live_count as usize)
+    } else {
+        &[]
+    };
+
+    match target.merge_from(source, live_labels) {
+        Ok(mapping) => {
+            for (i, (old_label, new_label)) in mapping.iter().enumerate() {
+                *out_old_labels.add(i) = *old_label;
+                *out_new_labels.add(i) = *new_label;
+            }
+            mapping.len() as i32
+        }
+        Err(e) => {
+            write_err(err_buf, err_buf_len, &format!("merge failed: {}", e));
+            -1
+        }
     }
 }
 
@@ -385,78 +537,5 @@ pub unsafe extern "C" fn lance_detached_get_all_vectors(
             write_err(err_buf, err_buf_len, &format!("get_all_vectors failed: {}", e));
             -1
         }
-    }
-}
-
-// ========================================
-// Serialize / Deserialize (metadata only)
-// ========================================
-
-#[no_mangle]
-pub unsafe extern "C" fn lance_detached_serialize_meta(
-    handle: LanceHandlePtr,
-    err_buf: *mut c_char,
-    err_buf_len: i32,
-) -> LanceBytes {
-    if handle.is_null() {
-        write_err(err_buf, err_buf_len, "null handle");
-        return LanceBytes {
-            data: std::ptr::null_mut(),
-            len: 0,
-            capacity: 0,
-        };
-    }
-    let h = &*(handle as *mut LanceIndex);
-    match h.serialize_meta() {
-        Ok(mut blob) => {
-            let data = blob.as_mut_ptr();
-            let len = blob.len();
-            let capacity = blob.capacity();
-            std::mem::forget(blob);
-            LanceBytes { data, len, capacity }
-        }
-        Err(e) => {
-            write_err(err_buf, err_buf_len, &format!("serialize_meta failed: {}", e));
-            LanceBytes {
-                data: std::ptr::null_mut(),
-                len: 0,
-                capacity: 0,
-            }
-        }
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn lance_detached_deserialize_meta(
-    db_path: *const c_char,
-    data: *const u8,
-    len: usize,
-    err_buf: *mut c_char,
-    err_buf_len: i32,
-) -> LanceHandlePtr {
-    if data.is_null() || len == 0 {
-        write_err(err_buf, err_buf_len, "null or empty data");
-        return std::ptr::null_mut();
-    }
-    let db_path_str = c_str_to_string(db_path);
-    let slice = slice::from_raw_parts(data, len);
-
-    match LanceIndex::deserialize_meta(&db_path_str, slice) {
-        Ok(index) => Box::into_raw(Box::new(index)) as LanceHandlePtr,
-        Err(e) => {
-            write_err(
-                err_buf,
-                err_buf_len,
-                &format!("deserialize_meta failed: {}", e),
-            );
-            std::ptr::null_mut()
-        }
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn lance_free_bytes(bytes: LanceBytes) {
-    if !bytes.data.is_null() && bytes.capacity > 0 {
-        drop(Vec::from_raw_parts(bytes.data, bytes.len, bytes.capacity));
     }
 }
