@@ -10,7 +10,6 @@
 #include "rust_ffi.hpp"
 
 #include <unordered_map>
-#include <unordered_set>
 
 namespace duckdb {
 
@@ -65,8 +64,8 @@ public:
 	idx_t GetVectorCount() const {
 		return rust_handle_ ? static_cast<idx_t>(LanceDetachedCount(rust_handle_)) : 0;
 	}
-	idx_t GetDeletedCount() const {
-		return deleted_labels_.size();
+	bool HasPendingDeletes() const {
+		return has_pending_deletes_;
 	}
 
 	friend class PhysicalCreateLanceIndex;
@@ -92,8 +91,8 @@ private:
 	vector<row_t> label_to_rowid_;
 	unordered_map<row_t, int64_t> rowid_to_label_;
 
-	// Tombstones
-	unordered_set<int64_t> deleted_labels_;
+	// Track whether deletes occurred since last vacuum
+	bool has_pending_deletes_ = false;
 
 	// Block storage (metadata only)
 	unique_ptr<FixedSizeAllocator> block_allocator_;
