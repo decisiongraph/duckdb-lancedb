@@ -1,0 +1,12 @@
+/Users/onnimonni/Projects/faiss/duckdb-lancedb/rust_lib/target/debug/deps/snafu-be304d831aa243f0.d: /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/lib.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/backtrace_inert.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/once_bool.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/error_chain.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/report.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/Snafu.md /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/report.md /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/../README.md
+
+/Users/onnimonni/Projects/faiss/duckdb-lancedb/rust_lib/target/debug/deps/libsnafu-be304d831aa243f0.rmeta: /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/lib.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/backtrace_inert.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/once_bool.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/error_chain.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/report.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/Snafu.md /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/report.md /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/../README.md
+
+/Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/lib.rs:
+/Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/backtrace_inert.rs:
+/Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/once_bool.rs:
+/Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/error_chain.rs:
+/Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/report.rs:
+/Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/Snafu.md:
+/Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/report.md:
+/Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.7.5/src/../README.md:

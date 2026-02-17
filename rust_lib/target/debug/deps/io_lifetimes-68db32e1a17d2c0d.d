@@ -1,0 +1,10 @@
+/Users/onnimonni/Projects/faiss/duckdb-lancedb/rust_lib/target/debug/deps/io_lifetimes-68db32e1a17d2c0d.d: /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-lifetimes-1.0.11/src/lib.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-lifetimes-1.0.11/src/portability.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-lifetimes-1.0.11/src/traits.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-lifetimes-1.0.11/src/example_ffi.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-lifetimes-1.0.11/src/raw.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-lifetimes-1.0.11/src/views.rs
+
+/Users/onnimonni/Projects/faiss/duckdb-lancedb/rust_lib/target/debug/deps/libio_lifetimes-68db32e1a17d2c0d.rmeta: /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-lifetimes-1.0.11/src/lib.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-lifetimes-1.0.11/src/portability.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-lifetimes-1.0.11/src/traits.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-lifetimes-1.0.11/src/example_ffi.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-lifetimes-1.0.11/src/raw.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-lifetimes-1.0.11/src/views.rs
+
+/Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-lifetimes-1.0.11/src/lib.rs:
+/Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-lifetimes-1.0.11/src/portability.rs:
+/Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-lifetimes-1.0.11/src/traits.rs:
+/Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-lifetimes-1.0.11/src/example_ffi.rs:
+/Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-lifetimes-1.0.11/src/raw.rs:
+/Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/io-lifetimes-1.0.11/src/views.rs:

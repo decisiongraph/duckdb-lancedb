@@ -1,0 +1,36 @@
+# name: test/sql/lance_delete.test
+# description: Test Lance index delete and vacuum
+# group: [lance]
+
+require lancedb
+
+statement ok
+CREATE TABLE vectors (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO vectors VALUES
+  (1, [1.0, 0.0, 0.0]),
+  (2, [0.0, 1.0, 0.0]),
+  (3, [0.0, 0.0, 1.0]);
+
+statement ok
+CREATE INDEX idx ON vectors USING LANCE (embedding);
+
+# Verify all three exist
+query I
+SELECT count(*) FROM lance_search('vectors', 'idx', [0.5, 0.5, 0.0], 10);
+----
+3
+
+# Delete a row
+statement ok
+DELETE FROM vectors WHERE id = 2;
+
+# Search should return 2 results (row 2 deleted)
+query I
+SELECT count(*) FROM lance_search('vectors', 'idx', [0.5, 0.5, 0.0], 10);
+----
+2
+
+statement ok
+DROP INDEX idx;

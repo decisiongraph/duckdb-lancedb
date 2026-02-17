@@ -1,0 +1,361 @@
+//! LanceDB index manager: create, add vectors, search, manage Lance datasets.
+
+use anyhow::{anyhow, Result};
+use arrow_array::{
+    ArrayRef, Float32Array, Int64Array, RecordBatch, RecordBatchIterator,
+    FixedSizeListArray,
+};
+use arrow_schema::{DataType, Field, Schema};
+use futures_util::TryStreamExt;
+use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::{Connection, Table as LanceTable};
+use parking_lot::RwLock;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
+
+use crate::runtime;
+
+/// Core LanceDB index handle.
+pub struct LanceIndex {
+    #[allow(dead_code)]
+    connection: Connection,
+    table: RwLock<Option<LanceTable>>,
+    table_name: String,
+    dimension: usize,
+    metric: String,
+    next_label: AtomicI64,
+    schema: Arc<Schema>,
+}
+
+impl LanceIndex {
+    /// Create a new Lance dataset at the given path.
+    pub fn create(db_path: &str, dimension: usize, metric: &str) -> Result<Self> {
+        let connection = runtime::block_on(lancedb::connect(db_path).execute())?;
+
+        let schema = Self::build_schema(dimension);
+        let table_name = "vectors".to_string();
+
+        // Create empty table with schema
+        let empty_batch = Self::empty_batch(&schema, dimension)?;
+        let batches = RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone());
+        let table = runtime::block_on(
+            connection
+                .create_table(&table_name, Box::new(batches))
+                .execute(),
+        )?;
+
+        Ok(Self {
+            connection,
+            table: RwLock::new(Some(table)),
+            table_name,
+            dimension,
+            metric: metric.to_string(),
+            next_label: AtomicI64::new(0),
+            schema,
+        })
+    }
+
+    /// Reopen an existing Lance dataset.
+    pub fn open(db_path: &str, dimension: usize, metric: &str) -> Result<Self> {
+        let connection = runtime::block_on(lancedb::connect(db_path).execute())?;
+        let table_name = "vectors".to_string();
+        let table = runtime::block_on(connection.open_table(&table_name).execute())?;
+
+        let schema = Self::build_schema(dimension);
+
+        // Determine next_label from existing data
+        let count = runtime::block_on(table.count_rows(None))? as i64;
+
+        Ok(Self {
+            connection,
+            table: RwLock::new(Some(table)),
+            table_name,
+            dimension,
+            metric: metric.to_string(),
+            next_label: AtomicI64::new(count),
+            schema,
+        })
+    }
+
+    /// Add a single vector. Returns the assigned label.
+    pub fn add_vector(&self, vector: &[f32]) -> Result<i64> {
+        if vector.len() != self.dimension {
+            return Err(anyhow!(
+                "expected dimension {}, got {}",
+                self.dimension,
+                vector.len()
+            ));
+        }
+
+        let label = self.next_label.fetch_add(1, Ordering::Relaxed);
+        let batch = self.make_batch(&[label], &[vector])?;
+
+        let table = self.table.read();
+        let table = table.as_ref().ok_or_else(|| anyhow!("table not open"))?;
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], self.schema.clone());
+        runtime::block_on(table.add(Box::new(batches)).execute())?;
+
+        Ok(label)
+    }
+
+    /// Add a batch of vectors. Returns labels.
+    pub fn add_batch(&self, vectors: &[f32], num_vectors: usize) -> Result<Vec<i64>> {
+        if vectors.len() != num_vectors * self.dimension {
+            return Err(anyhow!("vector data size mismatch"));
+        }
+
+        let start_label = self.next_label.fetch_add(num_vectors as i64, Ordering::Relaxed);
+        let labels: Vec<i64> = (start_label..start_label + num_vectors as i64).collect();
+
+        let vecs: Vec<&[f32]> = (0..num_vectors)
+            .map(|i| &vectors[i * self.dimension..(i + 1) * self.dimension])
+            .collect();
+
+        let batch = self.make_batch(&labels, &vecs)?;
+
+        let table = self.table.read();
+        let table = table.as_ref().ok_or_else(|| anyhow!("table not open"))?;
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], self.schema.clone());
+        runtime::block_on(table.add(Box::new(batches)).execute())?;
+
+        Ok(labels)
+    }
+
+    /// Search for k nearest neighbors.
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        nprobes: usize,
+        refine_factor: usize,
+    ) -> Result<Vec<(i64, f32)>> {
+        if query.len() != self.dimension {
+            return Err(anyhow!(
+                "expected query dimension {}, got {}",
+                self.dimension,
+                query.len()
+            ));
+        }
+
+        let table = self.table.read();
+        let table = table.as_ref().ok_or_else(|| anyhow!("table not open"))?;
+
+        let results = runtime::block_on(
+            table
+                .vector_search(query)
+                .map_err(|e| anyhow!("search setup: {}", e))?
+                .limit(k)
+                .nprobes(nprobes)
+                .refine_factor(refine_factor as u32)
+                .execute(),
+        )?;
+
+        let mut output = Vec::new();
+        let batches: Vec<RecordBatch> = runtime::block_on(async {
+            let mut batches = Vec::new();
+            let mut stream = results;
+            loop {
+                match stream.try_next().await {
+                    Ok(Some(batch)) => batches.push(batch),
+                    Ok(None) => break,
+                    Err(e) => return Err(anyhow!("stream error: {}", e)),
+                }
+            }
+            Ok(batches)
+        })?;
+
+        for batch in &batches {
+            let label_col = batch
+                .column_by_name("label")
+                .ok_or_else(|| anyhow!("missing label column"))?;
+            let labels = label_col
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow!("label column not Int64"))?;
+
+            let dist_col = batch
+                .column_by_name("_distance")
+                .ok_or_else(|| anyhow!("missing _distance column"))?;
+            let distances = dist_col
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| anyhow!("distance column not Float32"))?;
+
+            for i in 0..batch.num_rows() {
+                output.push((labels.value(i), distances.value(i)));
+            }
+        }
+
+        Ok(output)
+    }
+
+    /// Delete a vector by label.
+    pub fn delete(&self, label: i64) -> Result<()> {
+        let table = self.table.read();
+        let table = table.as_ref().ok_or_else(|| anyhow!("table not open"))?;
+        runtime::block_on(table.delete(&format!("label = {}", label)))?;
+        Ok(())
+    }
+
+    /// Count vectors.
+    pub fn count(&self) -> Result<u64> {
+        let table = self.table.read();
+        let table = table.as_ref().ok_or_else(|| anyhow!("table not open"))?;
+        let count = runtime::block_on(table.count_rows(None))?;
+        Ok(count as u64)
+    }
+
+    /// Create an ANN index (IVF_PQ).
+    pub fn create_ann_index(
+        &self,
+        _num_partitions: u32,
+        _num_sub_vectors: u32,
+    ) -> Result<()> {
+        let table = self.table.read();
+        let table = table.as_ref().ok_or_else(|| anyhow!("table not open"))?;
+
+        use lancedb::index::Index;
+        let _metric_type = match self.metric.as_str() {
+            "cosine" => lancedb::DistanceType::Cosine,
+            "dot" | "ip" | "inner_product" => lancedb::DistanceType::Dot,
+            _ => lancedb::DistanceType::L2,
+        };
+
+        runtime::block_on(
+            table
+                .create_index(
+                    &["vector"],
+                    Index::Auto,
+                )
+                .replace(true)
+                .execute(),
+        )?;
+
+        Ok(())
+    }
+
+    /// Compact the dataset (optimize storage).
+    pub fn compact(&self) -> Result<()> {
+        let table = self.table.read();
+        let table = table.as_ref().ok_or_else(|| anyhow!("table not open"))?;
+        runtime::block_on(table.optimize(lancedb::table::OptimizeAction::All)).map(|_| ())?;
+        Ok(())
+    }
+
+    /// Get a vector by label.
+    pub fn get_vector(&self, label: i64) -> Result<Vec<f32>> {
+        let table = self.table.read();
+        let table = table.as_ref().ok_or_else(|| anyhow!("table not open"))?;
+
+        let results = runtime::block_on(
+            table
+                .query()
+                .only_if(format!("label = {}", label))
+                .execute(),
+        )?;
+
+        let batches: Vec<RecordBatch> = runtime::block_on(async {
+            let mut batches = Vec::new();
+            let mut stream = results;
+            loop {
+                match stream.try_next().await {
+                    Ok(Some(batch)) => batches.push(batch),
+                    Ok(None) => break,
+                    Err(e) => return Err(anyhow!("stream error: {}", e)),
+                }
+            }
+            Ok(batches)
+        })?;
+
+        for batch in &batches {
+            if batch.num_rows() > 0 {
+                let vec_col = batch
+                    .column_by_name("vector")
+                    .ok_or_else(|| anyhow!("missing vector column"))?;
+                let list_array = vec_col
+                    .as_any()
+                    .downcast_ref::<FixedSizeListArray>()
+                    .ok_or_else(|| anyhow!("vector not FixedSizeList"))?;
+                let values = list_array
+                    .value(0);
+                let float_array = values
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or_else(|| anyhow!("vector values not Float32"))?;
+                return Ok(float_array.values().to_vec());
+            }
+        }
+
+        Err(anyhow!("label {} not found", label))
+    }
+
+    /// Serialize metadata (not vector data — Lance handles that on disk).
+    pub fn serialize_meta(&self) -> Result<Vec<u8>> {
+        let meta = LanceMeta {
+            dimension: self.dimension,
+            metric: self.metric.clone(),
+            next_label: self.next_label.load(Ordering::Relaxed),
+            table_name: self.table_name.clone(),
+        };
+        Ok(serde_json::to_vec(&meta)?)
+    }
+
+    /// Deserialize metadata and reopen the Lance dataset.
+    pub fn deserialize_meta(db_path: &str, data: &[u8]) -> Result<Self> {
+        let meta: LanceMeta = serde_json::from_slice(data)?;
+        let mut index = Self::open(db_path, meta.dimension, &meta.metric)?;
+        index.next_label = AtomicI64::new(meta.next_label);
+        Ok(index)
+    }
+
+    // Internal helpers
+
+    fn build_schema(dimension: usize) -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("label", DataType::Int64, false),
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::Float32, true)),
+                    dimension as i32,
+                ),
+                false,
+            ),
+        ]))
+    }
+
+    fn make_fixed_size_list(values: Float32Array, dimension: i32) -> FixedSizeListArray {
+        let field = Arc::new(Field::new("item", DataType::Float32, true));
+        let values_ref: ArrayRef = Arc::new(values);
+        FixedSizeListArray::new(field, dimension, values_ref, None)
+    }
+
+    fn empty_batch(schema: &Arc<Schema>, dimension: usize) -> Result<RecordBatch> {
+        let labels = Int64Array::from(Vec::<i64>::new());
+        let values = Float32Array::from(Vec::<f32>::new());
+        let list = Self::make_fixed_size_list(values, dimension as i32);
+        Ok(RecordBatch::try_new(schema.clone(), vec![
+            Arc::new(labels),
+            Arc::new(list),
+        ])?)
+    }
+
+    fn make_batch(&self, labels: &[i64], vectors: &[&[f32]]) -> Result<RecordBatch> {
+        let label_array = Int64Array::from(labels.to_vec());
+        let flat_values: Vec<f32> = vectors.iter().flat_map(|v| v.iter().copied()).collect();
+        let values = Float32Array::from(flat_values);
+        let list = Self::make_fixed_size_list(values, self.dimension as i32);
+        Ok(RecordBatch::try_new(self.schema.clone(), vec![
+            Arc::new(label_array),
+            Arc::new(list),
+        ])?)
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LanceMeta {
+    dimension: usize,
+    metric: String,
+    next_label: i64,
+    table_name: String,
+}

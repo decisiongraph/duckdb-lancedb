@@ -1,0 +1,63 @@
+# name: test/sql/lance_basic.test
+# description: Test basic Lance vector search
+# group: [lance]
+
+require lancedb
+
+# Create table with vectors
+statement ok
+CREATE TABLE vectors (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO vectors VALUES
+  (1, [1.0, 0.0, 0.0]),
+  (2, [0.0, 1.0, 0.0]),
+  (3, [0.0, 0.0, 1.0]);
+
+# Create LANCE index
+statement ok
+CREATE INDEX test_idx ON vectors USING LANCE (embedding);
+
+# Verify index exists
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'test_idx';
+----
+1
+
+# Search for nearest to [1,0,0]
+query II
+SELECT row_id, distance FROM lance_search('vectors', 'test_idx', [1.0, 0.0, 0.0], 2) ORDER BY distance;
+----
+0	0.0
+(varies)	(varies)
+
+# Search and JOIN back to table
+query II
+SELECT v.id, s.distance
+FROM lance_search('vectors', 'test_idx', [1.0, 0.0, 0.0], 3) s
+JOIN vectors v ON v.rowid = s.row_id
+ORDER BY s.distance;
+----
+1	0.0
+2	(varies)
+3	(varies)
+
+# Insert more vectors and search again
+statement ok
+INSERT INTO vectors VALUES (4, [0.9, 0.1, 0.0]);
+
+query I
+SELECT v.id
+FROM lance_search('vectors', 'test_idx', [1.0, 0.0, 0.0], 1) s
+JOIN vectors v ON v.rowid = s.row_id;
+----
+1
+
+# Drop index
+statement ok
+DROP INDEX test_idx;
+
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'test_idx';
+----
+0

@@ -1,0 +1,37 @@
+# name: test/sql/lance_persist.test
+# description: Test Lance index persistence across database restarts
+# group: [lance]
+
+require lancedb
+
+load __TEST_DIR__/lance_persist.db
+
+statement ok
+CREATE TABLE vectors (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO vectors VALUES
+  (1, [1.0, 0.0, 0.0]),
+  (2, [0.0, 1.0, 0.0]);
+
+statement ok
+CREATE INDEX idx ON vectors USING LANCE (embedding);
+
+query I
+SELECT count(*) FROM lance_search('vectors', 'idx', [1.0, 0.0, 0.0], 10);
+----
+2
+
+statement ok
+CHECKPOINT;
+
+restart
+
+# Verify index works after restart
+query I
+SELECT count(*) FROM lance_search('vectors', 'idx', [1.0, 0.0, 0.0], 10);
+----
+2
+
+statement ok
+DROP INDEX idx;
