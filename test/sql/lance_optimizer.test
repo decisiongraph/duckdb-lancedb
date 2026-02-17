@@ -73,3 +73,30 @@ LIMIT 1;
 
 statement ok
 DROP INDEX idx;
+
+# Metric mismatch: L2 index should NOT be used with array_cosine_distance()
+# Create a fresh table with L2 index (default metric)
+statement ok
+CREATE TABLE vecs2 (id INT, embedding FLOAT[3]);
+
+statement ok
+INSERT INTO vecs2 VALUES
+  (1, [1.0, 0.0, 0.0]),
+  (2, [0.0, 1.0, 0.0]),
+  (3, [0.0, 0.0, 1.0]);
+
+statement ok
+CREATE INDEX idx2 ON vecs2 USING LANCE (embedding);
+
+# array_cosine_distance with L2 index must NOT rewrite — falls back to normal sort
+# This should still return correct results (just not via index scan)
+query I
+SELECT v.id
+FROM vecs2 v
+ORDER BY array_cosine_distance(v.embedding, [1.0, 0.0, 0.0]::FLOAT[3])
+LIMIT 1;
+----
+1
+
+statement ok
+DROP INDEX idx2;

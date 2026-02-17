@@ -146,8 +146,7 @@ private:
 
 LanceIndex::LanceIndex(const string &name, IndexConstraintType constraint_type, const vector<column_t> &column_ids,
                        TableIOManager &table_io_manager, const vector<unique_ptr<Expression>> &unbound_expressions,
-                       AttachedDatabase &db, const case_insensitive_map_t<Value> &options,
-                       const IndexStorageInfo &info)
+                       AttachedDatabase &db, const case_insensitive_map_t<Value> &options, const IndexStorageInfo &info)
     : BoundIndex(name, TYPE_NAME, constraint_type, column_ids, table_io_manager, unbound_expressions, db) {
 
 	if (constraint_type != IndexConstraintType::NONE) {
@@ -253,18 +252,14 @@ PhysicalOperator &LanceIndex::CreatePlan(PlanIndexInput &input) {
 		select_list.push_back(std::move(op.expressions[i]));
 	}
 	new_column_types.emplace_back(LogicalType::ROW_TYPE);
-	select_list.push_back(
-	    make_uniq<BoundReferenceExpression>(LogicalType::ROW_TYPE, op.info->scan_types.size() - 1));
+	select_list.push_back(make_uniq<BoundReferenceExpression>(LogicalType::ROW_TYPE, op.info->scan_types.size() - 1));
 
-	auto &proj =
-	    planner.Make<PhysicalProjection>(new_column_types, std::move(select_list), op.estimated_cardinality);
+	auto &proj = planner.Make<PhysicalProjection>(new_column_types, std::move(select_list), op.estimated_cardinality);
 	proj.children.push_back(input.table_scan);
 
-	auto &create_idx = planner.Make<PhysicalCreateLanceIndex>(op, op.table, op.info->column_ids,
-	                                                          std::move(op.info),
+	auto &create_idx = planner.Make<PhysicalCreateLanceIndex>(op, op.table, op.info->column_ids, std::move(op.info),
 	                                                          std::move(op.unbound_expressions),
-	                                                          op.estimated_cardinality,
-	                                                          std::move(op.alter_table_info));
+	                                                          op.estimated_cardinality, std::move(op.alter_table_info));
 	create_idx.children.push_back(proj);
 	return create_idx;
 }
@@ -273,6 +268,8 @@ PhysicalOperator &LanceIndex::CreatePlan(PlanIndexInput &input) {
 // Append / Insert / Delete
 // ========================================
 
+// Transaction rollback: DuckDB calls Delete() for rows that were appended in a rolled-back
+// transaction, which correctly removes them from both the Lance dataset and our label maps.
 ErrorData LanceIndex::Append(IndexLock &lock, DataChunk &entries, Vector &row_identifiers) {
 	auto count = entries.size();
 	if (count == 0) {
@@ -420,8 +417,7 @@ void LanceIndex::Delete(IndexLock &lock, DataChunk &entries, Vector &row_identif
 	}
 
 	if (rust_handle_ && !labels_to_delete.empty()) {
-		LanceDetachedDeleteBatch(rust_handle_, labels_to_delete.data(),
-		                         static_cast<int32_t>(labels_to_delete.size()));
+		LanceDetachedDeleteBatch(rust_handle_, labels_to_delete.data(), static_cast<int32_t>(labels_to_delete.size()));
 		has_pending_deletes_ = true;
 	}
 
@@ -443,7 +439,8 @@ void LanceIndex::CommitDrop(IndexLock &lock) {
 // Search
 // ========================================
 
-vector<pair<row_t, float>> LanceIndex::Search(const float *query, int32_t dimension, int32_t k) {
+vector<pair<row_t, float>> LanceIndex::Search(const float *query, int32_t dimension, int32_t k,
+                                              const string &predicate) {
 	if (!rust_handle_ || dimension != dimension_) {
 		return {};
 	}
@@ -453,7 +450,7 @@ vector<pair<row_t, float>> LanceIndex::Search(const float *query, int32_t dimens
 	vector<int64_t> labels(k);
 	vector<float> distances(k);
 	auto n = LanceDetachedSearch(rust_handle_, query, dimension, k, nprobes_, refine_factor_,
-	                             labels.data(), distances.data());
+	                             predicate.empty() ? nullptr : predicate.c_str(), labels.data(), distances.data());
 
 	vector<pair<row_t, float>> results;
 	results.reserve(n);
@@ -479,6 +476,13 @@ void LanceIndex::CreateHnswIndex(int32_t m, int32_t ef_construction) {
 		throw IOException("Lance index not initialized");
 	}
 	LanceDetachedCreateHnswIndex(rust_handle_, m, ef_construction);
+}
+
+void LanceIndex::CreateScalarIndex(const string &column, const string &index_type) {
+	if (!rust_handle_) {
+		throw IOException("Lance index not initialized");
+	}
+	LanceDetachedCreateScalarIndex(rust_handle_, column, index_type);
 }
 
 // ========================================
@@ -727,6 +731,22 @@ void LanceIndex::Vacuum(IndexLock &state) {
 	}
 	LanceDetachedCompact(rust_handle_);
 	has_pending_deletes_ = false;
+
+	// Rebuild label_to_rowid_ from the authoritative rowid_to_label_ map.
+	// This compacts away deleted slots (marked -1) that accumulate over time.
+	vector<row_t> new_map;
+	for (auto &[row_id, label] : rowid_to_label_) {
+		if (label < 0) {
+			continue;
+		}
+		auto ulabel = static_cast<idx_t>(label);
+		if (ulabel >= new_map.size()) {
+			new_map.resize(ulabel + 1, -1);
+		}
+		new_map[ulabel] = row_id;
+	}
+	label_to_rowid_ = std::move(new_map);
+
 	is_dirty_ = true;
 }
 
@@ -783,8 +803,7 @@ PhysicalCreateLanceIndex::PhysicalCreateLanceIndex(PhysicalPlan &physical_plan, 
                                                    unique_ptr<AlterTableInfo> alter_table_info_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::CREATE_INDEX, op.types, estimated_cardinality),
       table(table_p.Cast<DuckTableEntry>()), info(std::move(info_p)),
-      unbound_expressions(std::move(unbound_expressions_p)),
-      alter_table_info(std::move(alter_table_info_p)) {
+      unbound_expressions(std::move(unbound_expressions_p)), alter_table_info(std::move(alter_table_info_p)) {
 	for (auto &column_id : column_ids) {
 		storage_ids.push_back(table.GetColumns().LogicalToPhysical(LogicalIndex(column_id)).index);
 	}
@@ -850,8 +869,7 @@ unique_ptr<GlobalSinkState> PhysicalCreateLanceIndex::GetGlobalSinkState(ClientC
 		auto client_props = context.GetClientProperties();
 		ArrowConverter::ToArrowSchema(&create_schema, col_types, col_names, client_props);
 
-		state->rust_handle =
-		    LanceCreateDetachedFromArrow(state->lance_path, &create_schema, state->metric, sanitized);
+		state->rust_handle = LanceCreateDetachedFromArrow(state->lance_path, &create_schema, state->metric, sanitized);
 
 		if (create_schema.release) {
 			create_schema.release(&create_schema);
