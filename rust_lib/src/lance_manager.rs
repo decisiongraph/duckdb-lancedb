@@ -64,8 +64,9 @@ impl LanceIndex {
 
         let schema = Self::build_schema(dimension);
 
-        // Determine next_label from existing data
-        let count = runtime::block_on(table.count_rows(None))? as i64;
+        // Use MAX(label)+1, not count_rows() — count is wrong after deletes.
+        // e.g. insert [0,1,2,3,4], delete [1,2] → count=3 but label 3 exists.
+        let next_label = Self::query_max_label(&table)? + 1;
 
         Ok(Self {
             connection,
@@ -73,7 +74,7 @@ impl LanceIndex {
             table_name,
             dimension,
             metric: metric.to_string(),
-            next_label: AtomicI64::new(count),
+            next_label: AtomicI64::new(next_label),
             schema,
         })
     }
@@ -384,6 +385,43 @@ impl LanceIndex {
 
     // Internal helpers
 
+    /// Query MAX(label) from the table. Returns -1 if empty.
+    fn query_max_label(table: &LanceTable) -> Result<i64> {
+        let count = runtime::block_on(table.count_rows(None))?;
+        if count == 0 {
+            return Ok(-1);
+        }
+
+        let results = runtime::block_on(table.query().execute())?;
+
+        let mut max_label: i64 = -1;
+        runtime::block_on(async {
+            let mut stream = results;
+            while let Some(batch) = stream
+                .try_next()
+                .await
+                .map_err(|e| anyhow!("stream error: {}", e))?
+            {
+                let label_col = batch
+                    .column_by_name("label")
+                    .ok_or_else(|| anyhow!("missing label column"))?;
+                let labels = label_col
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| anyhow!("label column not Int64"))?;
+                for i in 0..labels.len() {
+                    let val = labels.value(i);
+                    if val > max_label {
+                        max_label = val;
+                    }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })?;
+
+        Ok(max_label)
+    }
+
     fn build_schema(dimension: usize) -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("label", DataType::Int64, false),
@@ -443,4 +481,78 @@ struct LanceMeta {
     metric: String,
     next_label: i64,
     table_name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("failed to create temp dir")
+    }
+
+    #[test]
+    fn test_next_label_unique_after_deletes() {
+        let dir = temp_dir();
+        let db_path = dir.path().join("test.lance");
+        let db_path_str = db_path.to_str().unwrap();
+
+        // Insert 5 vectors with labels [0,1,2,3,4]
+        let idx = LanceIndex::create(db_path_str, 3, "l2").unwrap();
+        for i in 0..5 {
+            let label = idx.add_vector(&[i as f32, 0.0, 0.0]).unwrap();
+            assert_eq!(label, i);
+        }
+
+        // Delete labels [1,2]
+        idx.delete(1).unwrap();
+        idx.delete(2).unwrap();
+
+        // Reopen — next insert must NOT produce label 3 (already exists)
+        drop(idx);
+        let idx2 = LanceIndex::open(db_path_str, 3, "l2").unwrap();
+        let new_label = idx2.add_vector(&[99.0, 0.0, 0.0]).unwrap();
+        assert!(
+            new_label >= 5,
+            "expected label >= 5 after deletes, got {new_label}"
+        );
+    }
+
+    #[test]
+    fn test_next_label_correct_on_empty_reopen() {
+        let dir = temp_dir();
+        let db_path = dir.path().join("test_empty.lance");
+        let db_path_str = db_path.to_str().unwrap();
+
+        let idx = LanceIndex::create(db_path_str, 2, "l2").unwrap();
+        drop(idx);
+
+        let idx2 = LanceIndex::open(db_path_str, 2, "l2").unwrap();
+        let label = idx2.add_vector(&[1.0, 2.0]).unwrap();
+        assert_eq!(label, 0);
+    }
+
+    #[test]
+    fn test_deserialize_meta_preserves_next_label() {
+        let dir = temp_dir();
+        let db_path = dir.path().join("test_meta.lance");
+        let db_path_str = db_path.to_str().unwrap();
+
+        let idx = LanceIndex::create(db_path_str, 3, "l2").unwrap();
+        for i in 0..5 {
+            idx.add_vector(&[i as f32, 0.0, 0.0]).unwrap();
+        }
+        idx.delete(1).unwrap();
+        idx.delete(2).unwrap();
+
+        let meta = idx.serialize_meta().unwrap();
+        drop(idx);
+
+        let idx2 = LanceIndex::deserialize_meta(db_path_str, &meta).unwrap();
+        let new_label = idx2.add_vector(&[99.0, 0.0, 0.0]).unwrap();
+        assert!(
+            new_label >= 5,
+            "expected label >= 5 via deserialize_meta, got {new_label}"
+        );
+    }
 }
