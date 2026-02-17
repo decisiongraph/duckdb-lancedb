@@ -36,10 +36,12 @@ int32_t LanceDetachedGetVector(LanceHandle handle, int64_t label, float *out_vec
 // Pass nullptr for out_labels/out_vectors to get count first (via out_count).
 int32_t LanceDetachedGetAllVectors(LanceHandle handle, int64_t *out_labels, float *out_vectors, int64_t *out_count);
 
-// Metadata serialization (Lance handles vector data on disk)
+// Metadata serialization (Lance handles vector data on disk).
+// Must carry capacity for Rust Vec::from_raw_parts() on free.
 struct LanceSerializedMeta {
 	uint8_t *data;
 	size_t len;
+	size_t capacity;
 };
 LanceSerializedMeta LanceDetachedSerializeMeta(LanceHandle handle);
 LanceHandle LanceDetachedDeserializeMeta(const std::string &db_path, const uint8_t *data, size_t len);

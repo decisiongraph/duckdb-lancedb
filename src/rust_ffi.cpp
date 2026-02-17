@@ -150,7 +150,7 @@ LanceSerializedMeta LanceDetachedSerializeMeta(LanceHandle handle) {
 	if (!result.data) {
 		throw IOException("Lance serialize_meta: " + std::string(err_buf));
 	}
-	return {result.data, result.len};
+	return {result.data, result.len, result.capacity};
 }
 
 LanceHandle LanceDetachedDeserializeMeta(const std::string &db_path, const uint8_t *data, size_t len) {
@@ -163,7 +163,7 @@ LanceHandle LanceDetachedDeserializeMeta(const std::string &db_path, const uint8
 }
 
 void LanceFreeBytes(LanceSerializedMeta bytes) {
-	LanceBytesFFI raw = {bytes.data, bytes.len};
+	LanceBytesFFI raw = {bytes.data, bytes.len, bytes.capacity};
 	lance_free_bytes(raw);
 }
 
