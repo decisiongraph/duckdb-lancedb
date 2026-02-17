@@ -11,6 +11,7 @@ pub type LanceHandlePtr = *mut c_void;
 pub struct LanceBytes {
     pub data: *mut u8,
     pub len: usize,
+    pub capacity: usize,
 }
 
 // ========================================
@@ -109,10 +110,17 @@ pub unsafe extern "C" fn lance_detached_add_batch(
         return -1;
     }
     let h = &*(handle as *mut LanceIndex);
-    let total = (num as usize) * (dim as usize);
-    let vec_data = slice::from_raw_parts(vectors, total);
+    debug_assert_eq!(
+        dim as usize,
+        h.dimension(),
+        "C++ passed dim={} but LanceIndex has dimension={}",
+        dim,
+        h.dimension()
+    );
+    let total_floats = num as usize * h.dimension();
+    let vec_slice = slice::from_raw_parts(vectors, total_floats);
 
-    match h.add_batch(vec_data, num as usize) {
+    match h.add_batch(vec_slice, num as usize) {
         Ok(labels) => {
             for (i, label) in labels.iter().enumerate() {
                 *out_labels.add(i) = *label;
@@ -211,6 +219,29 @@ pub unsafe extern "C" fn lance_detached_delete(
     }
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn lance_detached_delete_batch(
+    handle: LanceHandlePtr,
+    labels: *const i64,
+    count: i32,
+    err_buf: *mut c_char,
+    err_buf_len: i32,
+) -> i32 {
+    if handle.is_null() {
+        write_err(err_buf, err_buf_len, "null handle");
+        return -1;
+    }
+    let h = &*(handle as *mut LanceIndex);
+    let label_slice = slice::from_raw_parts(labels, count as usize);
+    match h.delete_batch(label_slice) {
+        Ok(()) => 0,
+        Err(e) => {
+            write_err(err_buf, err_buf_len, &format!("delete_batch failed: {}", e));
+            -1
+        }
+    }
+}
+
 // ========================================
 // ANN Index / Compact
 // ========================================
@@ -293,6 +324,47 @@ pub unsafe extern "C" fn lance_detached_get_vector(
 }
 
 // ========================================
+// Bulk vector export
+// ========================================
+
+/// Export all vectors from a detached index.
+/// Returns count of vectors. Fills out_labels and out_vectors (caller-allocated).
+/// out_vectors must hold count * dimension floats.
+/// Call with null out_labels/out_vectors to get the count first.
+#[no_mangle]
+pub unsafe extern "C" fn lance_detached_get_all_vectors(
+    handle: LanceHandlePtr,
+    out_labels: *mut i64,
+    out_vectors: *mut f32,
+    out_count: *mut i64,
+    err_buf: *mut c_char,
+    err_buf_len: i32,
+) -> i32 {
+    if handle.is_null() {
+        write_err(err_buf, err_buf_len, "null handle");
+        return -1;
+    }
+    let h = &*(handle as *mut LanceIndex);
+    match h.get_all_vectors() {
+        Ok((labels, vectors)) => {
+            let count = labels.len();
+            if !out_count.is_null() {
+                *out_count = count as i64;
+            }
+            if !out_labels.is_null() && !out_vectors.is_null() {
+                std::ptr::copy_nonoverlapping(labels.as_ptr(), out_labels, count);
+                std::ptr::copy_nonoverlapping(vectors.as_ptr(), out_vectors, vectors.len());
+            }
+            count as i32
+        }
+        Err(e) => {
+            write_err(err_buf, err_buf_len, &format!("get_all_vectors failed: {}", e));
+            -1
+        }
+    }
+}
+
+// ========================================
 // Serialize / Deserialize (metadata only)
 // ========================================
 
@@ -307,22 +379,24 @@ pub unsafe extern "C" fn lance_detached_serialize_meta(
         return LanceBytes {
             data: std::ptr::null_mut(),
             len: 0,
+            capacity: 0,
         };
     }
     let h = &*(handle as *mut LanceIndex);
     match h.serialize_meta() {
         Ok(mut blob) => {
-            blob.shrink_to_fit();
             let data = blob.as_mut_ptr();
             let len = blob.len();
+            let capacity = blob.capacity();
             std::mem::forget(blob);
-            LanceBytes { data, len }
+            LanceBytes { data, len, capacity }
         }
         Err(e) => {
             write_err(err_buf, err_buf_len, &format!("serialize_meta failed: {}", e));
             LanceBytes {
                 data: std::ptr::null_mut(),
                 len: 0,
+                capacity: 0,
             }
         }
     }
@@ -358,7 +432,7 @@ pub unsafe extern "C" fn lance_detached_deserialize_meta(
 
 #[no_mangle]
 pub unsafe extern "C" fn lance_free_bytes(bytes: LanceBytes) {
-    if !bytes.data.is_null() && bytes.len > 0 {
-        drop(Vec::from_raw_parts(bytes.data, bytes.len, bytes.len));
+    if !bytes.data.is_null() && bytes.capacity > 0 {
+        drop(Vec::from_raw_parts(bytes.data, bytes.len, bytes.capacity));
     }
 }

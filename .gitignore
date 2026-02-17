@@ -1,0 +1,7 @@
+build/
+rust_lib/target/
+.devenv/
+.devenv.flake.nix
+devenv.lock
+:memory:.lance/
+*.lance/

@@ -14,14 +14,45 @@
 #include "duckdb/storage/table_io_manager.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/common/exception/transaction_exception.hpp"
-#include "duckdb/planner/physical_plan_generator.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 
 #include <cstring>
-#include <filesystem>
+#include <cstdlib>
+#include <unistd.h>
 
 namespace duckdb {
+
+// Sanitize index name for safe use in filesystem paths
+static string SanitizeIndexName(const string &name) {
+	string result;
+	result.reserve(name.size());
+	for (char c : name) {
+		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+			result += c;
+		} else {
+			result += '_';
+		}
+	}
+	if (result.empty()) {
+		result = "lance_idx";
+	}
+	return result;
+}
+
+// Generate a unique temp directory path for in-memory DBs
+static string MakeUniqueTempPath(const string &sanitized_name) {
+	const char *tmp_dir = std::getenv("TMPDIR");
+	if (!tmp_dir) {
+		tmp_dir = "/tmp";
+	}
+	auto pid = std::to_string(getpid());
+	// Use address of a stack variable as a cheap unique suffix
+	int stack_var;
+	auto addr = reinterpret_cast<uintptr_t>(&stack_var);
+	return string(tmp_dir) + "/duckdb_lance_" + pid + "_" + sanitized_name + "_" + std::to_string(addr);
+}
 
 // ========================================
 // LinkedBlock storage (metadata only for Lance)
@@ -154,15 +185,20 @@ LanceIndex::~LanceIndex() {
 	}
 }
 
-string LanceIndex::GetLancePath() const {
-	// Store Lance data alongside the DuckDB file
+string LanceIndex::GetLancePath() {
+	if (!lance_path_.empty()) {
+		return lance_path_;
+	}
+	auto sanitized = SanitizeIndexName(name);
 	auto &storage_manager = db.GetStorageManager();
 	auto db_path = storage_manager.GetDBPath();
 	if (db_path.empty()) {
-		// In-memory DB: use temp directory
-		return "/tmp/duckdb_lance_" + name;
+		// In-memory DB: use unique temp directory to avoid collisions
+		lance_path_ = MakeUniqueTempPath(sanitized);
+	} else {
+		lance_path_ = db_path + ".lance/" + sanitized;
 	}
-	return db_path + ".lance/" + name;
+	return lance_path_;
 }
 
 unique_ptr<BoundIndex> LanceIndex::Create(CreateIndexInput &input) {
@@ -235,12 +271,15 @@ ErrorData LanceIndex::Append(IndexLock &lock, DataChunk &entries, Vector &row_id
 	row_identifiers.ToUnifiedFormat(count, rowid_format);
 	auto rowid_data = reinterpret_cast<row_t *>(rowid_format.data);
 
-	for (idx_t i = 0; i < count; i++) {
+	vector<int64_t> labels(count);
+	auto n = LanceDetachedAddBatch(rust_handle_, child_data,
+	                               static_cast<int32_t>(count),
+	                               dimension_, labels.data());
+
+	for (idx_t i = 0; i < static_cast<idx_t>(n); i++) {
 		auto row_idx = rowid_format.sel->get_index(i);
 		auto row_id = rowid_data[row_idx];
-		const float *vec_ptr = child_data + i * array_size;
-
-		auto label = LanceDetachedAdd(rust_handle_, vec_ptr, dimension_);
+		auto label = labels[i];
 
 		if (static_cast<idx_t>(label) >= label_to_rowid_.size()) {
 			label_to_rowid_.resize(label + 1, -1);
@@ -267,6 +306,10 @@ void LanceIndex::Delete(IndexLock &lock, DataChunk &entries, Vector &row_identif
 	row_identifiers.ToUnifiedFormat(count, rowid_format);
 	auto rowid_data = reinterpret_cast<row_t *>(rowid_format.data);
 
+	// Collect labels to delete in a single batch
+	vector<int64_t> labels_to_delete;
+	labels_to_delete.reserve(count);
+
 	for (idx_t i = 0; i < count; i++) {
 		auto row_idx = rowid_format.sel->get_index(i);
 		auto row_id = rowid_data[row_idx];
@@ -274,11 +317,14 @@ void LanceIndex::Delete(IndexLock &lock, DataChunk &entries, Vector &row_identif
 		auto it = rowid_to_label_.find(row_id);
 		if (it != rowid_to_label_.end()) {
 			deleted_labels_.insert(it->second);
-			if (rust_handle_) {
-				LanceDetachedDelete(rust_handle_, it->second);
-			}
+			labels_to_delete.push_back(it->second);
 			rowid_to_label_.erase(it);
 		}
+	}
+
+	if (rust_handle_ && !labels_to_delete.empty()) {
+		LanceDetachedDeleteBatch(rust_handle_, labels_to_delete.data(),
+		                         static_cast<int32_t>(labels_to_delete.size()));
 	}
 
 	is_dirty_ = true;
@@ -291,8 +337,8 @@ void LanceIndex::CommitDrop(IndexLock &lock) {
 	}
 	// Clean up Lance directory
 	auto lance_path = GetLancePath();
-	std::error_code ec;
-	std::filesystem::remove_all(lance_path, ec);
+	auto &fs = FileSystem::GetFileSystem(db.GetDatabase());
+	fs.RemoveDirectory(lance_path);
 }
 
 // ========================================
@@ -304,32 +350,52 @@ vector<pair<row_t, float>> LanceIndex::Search(const float *query, int32_t dimens
 		return {};
 	}
 
-	int32_t request_k = k + static_cast<int32_t>(deleted_labels_.size());
-	auto total = LanceDetachedCount(rust_handle_);
-	request_k = MinValue<int32_t>(request_k, static_cast<int32_t>(total));
-	if (request_k <= 0) {
+	auto total = static_cast<int32_t>(label_to_rowid_.size());
+	if (total <= 0) {
 		return {};
 	}
 
-	vector<int64_t> labels(request_k);
-	vector<float> distances(request_k);
-	auto n = LanceDetachedSearch(rust_handle_, query, dimension, request_k, nprobes_, refine_factor_, labels.data(),
-	                             distances.data());
-
+	// Retry with increasing multiplier until we get k live results or exhaust data.
+	// This handles the case where many tombstones exist (e.g., 1000 tombstones + k=10).
 	vector<pair<row_t, float>> results;
 	results.reserve(k);
 
-	for (int32_t i = 0; i < n && static_cast<int32_t>(results.size()) < k; i++) {
-		auto label = labels[i];
-		if (deleted_labels_.count(label) > 0) {
-			continue;
+	for (int32_t multiplier = 2; multiplier <= 32; multiplier *= 2) {
+		int32_t request_k = MinValue<int32_t>(k * multiplier, total);
+		if (request_k <= 0) {
+			break;
 		}
-		if (label < static_cast<int64_t>(label_to_rowid_.size())) {
-			results.emplace_back(label_to_rowid_[label], distances[i]);
+
+		vector<int64_t> labels(request_k);
+		vector<float> distances(request_k);
+		auto n = LanceDetachedSearch(rust_handle_, query, dimension, request_k, nprobes_, refine_factor_,
+		                             labels.data(), distances.data());
+
+		results.clear();
+		for (int32_t i = 0; i < n && static_cast<int32_t>(results.size()) < k; i++) {
+			auto label = labels[i];
+			if (deleted_labels_.count(label) > 0) {
+				continue;
+			}
+			if (label < static_cast<int64_t>(label_to_rowid_.size())) {
+				results.emplace_back(label_to_rowid_[label], distances[i]);
+			}
+		}
+
+		// Got enough results or already fetched everything
+		if (static_cast<int32_t>(results.size()) >= k || request_k >= total) {
+			break;
 		}
 	}
 
 	return results;
+}
+
+void LanceIndex::CreateAnnIndex(int32_t num_partitions, int32_t num_sub_vectors) {
+	if (!rust_handle_) {
+		throw IOException("Lance index not initialized");
+	}
+	LanceDetachedCreateIndex(rust_handle_, num_partitions, num_sub_vectors);
 }
 
 // ========================================
@@ -494,31 +560,54 @@ bool LanceIndex::MergeIndexes(IndexLock &state, BoundIndex &other_index) {
 		return true;
 	}
 
-	auto other_count = LanceDetachedCount(other.rust_handle_);
-	vector<float> vec_buf(dimension_);
+	// Bulk export all vectors from other index in a single FFI call
+	int64_t other_vec_count = 0;
+	LanceDetachedGetAllVectors(other.rust_handle_, nullptr, nullptr, &other_vec_count);
 
-	for (int64_t label = 0; label < other_count; label++) {
+	if (other_vec_count <= 0) {
+		is_dirty_ = true;
+		return true;
+	}
+
+	vector<int64_t> other_labels(other_vec_count);
+	vector<float> other_vectors(other_vec_count * dimension_);
+	LanceDetachedGetAllVectors(other.rust_handle_, other_labels.data(), other_vectors.data(), &other_vec_count);
+
+	// Filter out tombstoned vectors and collect live ones
+	vector<float> live_vectors;
+	vector<row_t> live_rowids;
+
+	for (int64_t i = 0; i < other_vec_count; i++) {
+		auto label = other_labels[i];
 		if (other.deleted_labels_.count(label) > 0) {
 			continue;
 		}
-
-		auto dim = LanceDetachedGetVector(other.rust_handle_, label, vec_buf.data(), dimension_);
-		if (dim <= 0) {
-			continue;
-		}
-
 		if (label >= static_cast<int64_t>(other.label_to_rowid_.size())) {
 			continue;
 		}
-		auto row_id = other.label_to_rowid_[label];
 
-		auto new_label = LanceDetachedAdd(rust_handle_, vec_buf.data(), dimension_);
+		auto vec_start = i * dimension_;
+		live_vectors.insert(live_vectors.end(), other_vectors.begin() + vec_start,
+		                    other_vectors.begin() + vec_start + dimension_);
+		live_rowids.push_back(other.label_to_rowid_[label]);
+	}
 
-		if (static_cast<idx_t>(new_label) >= label_to_rowid_.size()) {
-			label_to_rowid_.resize(new_label + 1, -1);
+	// Single batch insert
+	if (!live_rowids.empty()) {
+		auto num = static_cast<int32_t>(live_rowids.size());
+		vector<int64_t> new_labels(num);
+		LanceDetachedAddBatch(rust_handle_, live_vectors.data(), num, dimension_, new_labels.data());
+
+		for (idx_t i = 0; i < static_cast<idx_t>(num); i++) {
+			auto row_id = live_rowids[i];
+			auto label = new_labels[i];
+
+			if (static_cast<idx_t>(label) >= label_to_rowid_.size()) {
+				label_to_rowid_.resize(label + 1, -1);
+			}
+			label_to_rowid_[label] = row_id;
+			rowid_to_label_[row_id] = label;
 		}
-		label_to_rowid_[new_label] = row_id;
-		rowid_to_label_[row_id] = new_label;
 	}
 
 	is_dirty_ = true;
@@ -605,24 +694,25 @@ unique_ptr<GlobalSinkState> PhysicalCreateLanceIndex::GetGlobalSinkState(ClientC
 	}
 
 	// Determine Lance path
+	auto sanitized = SanitizeIndexName(info->index_name);
 	auto &storage = table.GetStorage();
 	auto &storage_manager = storage.db.GetStorageManager();
 	auto db_path = storage_manager.GetDBPath();
 	if (db_path.empty()) {
-		state->lance_path = "/tmp/duckdb_lance_" + info->index_name;
+		state->lance_path = MakeUniqueTempPath(sanitized);
 	} else {
-		state->lance_path = db_path + ".lance/" + info->index_name;
+		state->lance_path = db_path + ".lance/" + sanitized;
 	}
 
 	// Ensure parent directory exists
-	std::filesystem::create_directories(std::filesystem::path(state->lance_path).parent_path());
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto parent = state->lance_path.substr(0, state->lance_path.rfind('/'));
+	if (!parent.empty()) {
+		fs.CreateDirectory(parent);
+	}
 
 	state->rust_handle = LanceCreateDetached(state->lance_path, state->dimension, state->metric);
 	return std::move(state);
-}
-
-unique_ptr<LocalSinkState> PhysicalCreateLanceIndex::GetLocalSinkState(ExecutionContext &context) const {
-	return nullptr;
 }
 
 SinkResultType PhysicalCreateLanceIndex::Sink(ExecutionContext &context, DataChunk &chunk,
@@ -648,23 +738,19 @@ SinkResultType PhysicalCreateLanceIndex::Sink(ExecutionContext &context, DataChu
 	rowid_col.ToUnifiedFormat(count, rowid_format);
 	auto rowid_data = reinterpret_cast<row_t *>(rowid_format.data);
 
-	for (idx_t i = 0; i < count; i++) {
+	vector<int64_t> labels(count);
+	auto n = LanceDetachedAddBatch(state.rust_handle, child_data,
+	                               static_cast<int32_t>(count),
+	                               state.dimension, labels.data());
+
+	for (idx_t i = 0; i < static_cast<idx_t>(n); i++) {
 		auto row_idx = rowid_format.sel->get_index(i);
 		auto row_id = rowid_data[row_idx];
-		const float *vec_ptr = child_data + i * array_size;
-
-		auto label = LanceDetachedAdd(state.rust_handle, vec_ptr, state.dimension);
-
 		state.label_to_rowid.push_back(row_id);
-		state.rowid_to_label[row_id] = label;
+		state.rowid_to_label[row_id] = labels[i];
 	}
 
 	return SinkResultType::NEED_MORE_INPUT;
-}
-
-SinkCombineResultType PhysicalCreateLanceIndex::Combine(ExecutionContext &context,
-                                                        OperatorSinkCombineInput &input) const {
-	return SinkCombineResultType::FINISHED;
 }
 
 SinkFinalizeType PhysicalCreateLanceIndex::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,

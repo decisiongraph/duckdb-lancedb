@@ -24,23 +24,22 @@ SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'test_idx';
 ----
 1
 
-# Search for nearest to [1,0,0]
-query II
-SELECT row_id, distance FROM lance_search('vectors', 'test_idx', [1.0, 0.0, 0.0], 2) ORDER BY distance;
+# Search for nearest to [1,0,0] — top-1 must be exact match
+query IR
+SELECT row_id, distance FROM lance_search('vectors', 'test_idx', [1.0, 0.0, 0.0], 1) ORDER BY distance;
 ----
-0	0.0
-(varies)	(varies)
+0	0.000000
 
 # Search and JOIN back to table
-query II
+query IR
 SELECT v.id, s.distance
 FROM lance_search('vectors', 'test_idx', [1.0, 0.0, 0.0], 3) s
 JOIN vectors v ON v.rowid = s.row_id
 ORDER BY s.distance;
 ----
-1	0.0
-2	(varies)
-3	(varies)
+1	0.000000
+2	2.000000
+3	2.000000
 
 # Insert more vectors and search again
 statement ok
@@ -52,6 +51,12 @@ FROM lance_search('vectors', 'test_idx', [1.0, 0.0, 0.0], 1) s
 JOIN vectors v ON v.rowid = s.row_id;
 ----
 1
+
+# Search with wrong dimension returns 0 results (dimension mismatch)
+query I
+SELECT count(*) FROM lance_search('vectors', 'test_idx', [1.0, 0.0], 1);
+----
+0
 
 # Drop index
 statement ok

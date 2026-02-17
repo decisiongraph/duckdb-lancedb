@@ -103,11 +103,17 @@ static void LanceSearchScan(ClientContext &context, TableFunctionInput &data, Da
 	output.SetCardinality(chunk_size);
 }
 
+static unique_ptr<NodeStatistics> LanceSearchCardinality(ClientContext &context, const FunctionData *bind_data_p) {
+	auto &bind = bind_data_p->Cast<LanceSearchBindData>();
+	return make_uniq<NodeStatistics>(bind.k, bind.k);
+}
+
 void RegisterLanceSearchFunction(ExtensionLoader &loader) {
 	TableFunction func(
 	    "lance_search",
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::FLOAT), LogicalType::INTEGER},
 	    LanceSearchScan, LanceSearchBind, LanceSearchInit);
+	func.cardinality = LanceSearchCardinality;
 	loader.RegisterFunction(func);
 }
 

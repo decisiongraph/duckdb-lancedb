@@ -3176,7 +3176,6 @@ dependencies = [
  "arrow-schema",
  "futures-util",
  "lancedb",
- "parking_lot",
  "serde",
  "serde_json",
  "tokio",

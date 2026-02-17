@@ -71,12 +71,12 @@ static unique_ptr<GlobalTableFunctionState> LanceInfoInit(ClientContext &context
 					auto &lance_idx = idx_ptr->Cast<LanceIndex>();
 					e.dimension = lance_idx.GetDimension();
 					e.vector_count = static_cast<int64_t>(lance_idx.GetVectorCount());
-					e.metric = "l2"; // TODO: expose from index
+					e.metric = lance_idx.GetMetric();
 				}
-			} catch (...) {
+			} catch (const std::exception &ex) {
 				e.dimension = -1;
 				e.vector_count = -1;
-				e.metric = "?";
+				e.metric = ex.what();
 			}
 
 			state->entries.push_back(std::move(e));

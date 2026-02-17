@@ -88,39 +88,7 @@ else()
 endif()
 
 # ========================================
-# 2. Optional Metal GPU backend (macOS only)
-# ========================================
-
-set(LANCE_METAL_AVAILABLE OFF)
-if(APPLE)
-    find_library(METAL_FW Metal)
-    find_library(MPS_FW MetalPerformanceShaders)
-    if(METAL_FW AND MPS_FW)
-        set(LANCE_METAL_AVAILABLE ON)
-        enable_language(OBJCXX)
-
-        execute_process(
-            COMMAND /usr/bin/xcrun --sdk macosx --show-sdk-path
-            OUTPUT_VARIABLE REAL_MACOS_SDK
-            OUTPUT_STRIP_TRAILING_WHITESPACE)
-
-        set(LANCE_METAL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lance-metal")
-        if(EXISTS "${LANCE_METAL_DIR}/CMakeLists.txt")
-            add_subdirectory(${LANCE_METAL_DIR} lance-metal-build)
-            message(STATUS "Lance Metal GPU: ENABLED")
-        else()
-            message(STATUS "Lance Metal GPU: DISABLED (lance-metal not found)")
-            set(LANCE_METAL_AVAILABLE OFF)
-        endif()
-    else()
-        message(STATUS "Lance Metal GPU: DISABLED (Metal frameworks not found)")
-    endif()
-else()
-    message(STATUS "Lance Metal GPU: DISABLED (not macOS)")
-endif()
-
-# ========================================
-# 3. C++ Extension sources
+# 2. C++ Extension sources
 # ========================================
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
@@ -137,18 +105,13 @@ set(EXTENSION_SOURCES
     src/lance_functions.cpp
     src/lance_list.cpp
     src/rust_ffi.cpp
-    src/gpu_backend_cpu.cpp
 )
-
-if(LANCE_METAL_AVAILABLE)
-    list(APPEND EXTENSION_SOURCES src/gpu_backend_metal.mm)
-endif()
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 # ========================================
-# 4. Linking
+# 3. Linking
 # ========================================
 
 add_dependencies(${EXTENSION_NAME} lancedb_rust_build)
@@ -169,24 +132,6 @@ elseif(WIN32)
 elseif(UNIX)
     target_link_libraries(${EXTENSION_NAME} dl pthread m)
     target_link_libraries(${LOADABLE_EXTENSION_NAME} dl pthread m)
-endif()
-
-# Link Metal GPU backend
-if(LANCE_METAL_AVAILABLE)
-    target_link_libraries(${EXTENSION_NAME} lance_metal
-        "-framework Metal" "-framework MetalPerformanceShaders" "-framework Foundation")
-    target_link_libraries(${LOADABLE_EXTENSION_NAME} lance_metal
-        "-framework Metal" "-framework MetalPerformanceShaders" "-framework Foundation")
-
-    target_compile_definitions(${EXTENSION_NAME} PRIVATE LANCE_METAL_AVAILABLE=1)
-    target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE LANCE_METAL_AVAILABLE=1)
-
-    if(REAL_MACOS_SDK)
-        target_compile_options(${EXTENSION_NAME} PRIVATE
-            -iframework ${REAL_MACOS_SDK}/System/Library/Frameworks)
-        target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE
-            -iframework ${REAL_MACOS_SDK}/System/Library/Frameworks)
-    endif()
 endif()
 
 install(

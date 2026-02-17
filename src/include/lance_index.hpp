@@ -53,8 +53,14 @@ public:
 	// ANN search
 	vector<pair<row_t, float>> Search(const float *query, int32_t dimension, int32_t k);
 
+	// Build ANN index on the Lance dataset
+	void CreateAnnIndex(int32_t num_partitions, int32_t num_sub_vectors);
+
 	int32_t GetDimension() const {
 		return dimension_;
+	}
+	const string &GetMetric() const {
+		return metric_;
 	}
 	idx_t GetVectorCount() const {
 		return rust_handle_ ? static_cast<idx_t>(LanceDetachedCount(rust_handle_)) : 0;
@@ -68,10 +74,13 @@ public:
 private:
 	void PersistToDisk();
 	void LoadFromStorage(const IndexStorageInfo &info);
-	string GetLancePath() const;
+	string GetLancePath();
 
 	// Rust Lance handle
 	LanceHandle rust_handle_ = nullptr;
+
+	// Cached Lance dataset path (generated once, reused)
+	string lance_path_;
 
 	// Parameters
 	int32_t dimension_ = 0;
@@ -117,10 +126,8 @@ public:
 		return true;
 	}
 
-	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override;
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
-	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	                          OperatorSinkFinalizeInput &input) const override;
 

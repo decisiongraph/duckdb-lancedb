@@ -1,9 +1,0 @@
-/Users/onnimonni/Projects/faiss/duckdb-lancedb/rust_lib/target/debug/deps/aws_smithy_xml-0be71f8e68290675.d: /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-smithy-xml-0.60.14/src/lib.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-smithy-xml-0.60.14/src/decode.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-smithy-xml-0.60.14/src/encode.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-smithy-xml-0.60.14/src/escape.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-smithy-xml-0.60.14/src/unescape.rs
-
-/Users/onnimonni/Projects/faiss/duckdb-lancedb/rust_lib/target/debug/deps/libaws_smithy_xml-0be71f8e68290675.rmeta: /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-smithy-xml-0.60.14/src/lib.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-smithy-xml-0.60.14/src/decode.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-smithy-xml-0.60.14/src/encode.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-smithy-xml-0.60.14/src/escape.rs /Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-smithy-xml-0.60.14/src/unescape.rs
-
-/Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-smithy-xml-0.60.14/src/lib.rs:
-/Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-smithy-xml-0.60.14/src/decode.rs:
-/Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-smithy-xml-0.60.14/src/encode.rs:
-/Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-smithy-xml-0.60.14/src/escape.rs:
-/Users/onnimonni/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-smithy-xml-0.60.14/src/unescape.rs:

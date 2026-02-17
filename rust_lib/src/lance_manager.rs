@@ -9,7 +9,6 @@ use arrow_schema::{DataType, Field, Schema};
 use futures_util::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, Table as LanceTable};
-use parking_lot::RwLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
@@ -19,7 +18,7 @@ use crate::runtime;
 pub struct LanceIndex {
     #[allow(dead_code)]
     connection: Connection,
-    table: RwLock<Option<LanceTable>>,
+    table: Option<LanceTable>,
     table_name: String,
     dimension: usize,
     metric: String,
@@ -35,9 +34,11 @@ impl LanceIndex {
         let schema = Self::build_schema(dimension);
         let table_name = "vectors".to_string();
 
-        // Create empty table with schema
+        // Create empty table with schema (drop existing if present)
         let empty_batch = Self::empty_batch(&schema, dimension)?;
         let batches = RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone());
+        // Try to drop existing table first (ignore errors if it doesn't exist)
+        let _ = runtime::block_on(connection.drop_table(&table_name));
         let table = runtime::block_on(
             connection
                 .create_table(&table_name, Box::new(batches))
@@ -46,7 +47,7 @@ impl LanceIndex {
 
         Ok(Self {
             connection,
-            table: RwLock::new(Some(table)),
+            table: Some(table),
             table_name,
             dimension,
             metric: metric.to_string(),
@@ -68,13 +69,31 @@ impl LanceIndex {
 
         Ok(Self {
             connection,
-            table: RwLock::new(Some(table)),
+            table: Some(table),
             table_name,
             dimension,
             metric: metric.to_string(),
             next_label: AtomicI64::new(count),
             schema,
         })
+    }
+
+    /// Get the dimension of vectors in this index.
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    /// Get the metric name.
+    pub fn metric(&self) -> &str {
+        &self.metric
+    }
+
+    /// Clone the table handle. LanceTable is Arc-based (O(1) clone).
+    fn get_table(&self) -> Result<LanceTable> {
+        self.table
+            .as_ref()
+            .ok_or_else(|| anyhow!("table not open"))
+            .cloned()
     }
 
     /// Add a single vector. Returns the assigned label.
@@ -90,15 +109,16 @@ impl LanceIndex {
         let label = self.next_label.fetch_add(1, Ordering::Relaxed);
         let batch = self.make_batch(&[label], &[vector])?;
 
-        let table = self.table.read();
-        let table = table.as_ref().ok_or_else(|| anyhow!("table not open"))?;
+        let table = self.get_table()?;
         let batches = RecordBatchIterator::new(vec![Ok(batch)], self.schema.clone());
         runtime::block_on(table.add(Box::new(batches)).execute())?;
 
         Ok(label)
     }
 
-    /// Add a batch of vectors. Returns labels.
+    /// Add a batch of contiguous vectors. Returns labels.
+    ///
+    /// `vectors` must be a flat contiguous array: [v0_d0, v0_d1, ..., v1_d0, v1_d1, ...].
     pub fn add_batch(&self, vectors: &[f32], num_vectors: usize) -> Result<Vec<i64>> {
         if vectors.len() != num_vectors * self.dimension {
             return Err(anyhow!("vector data size mismatch"));
@@ -107,14 +127,9 @@ impl LanceIndex {
         let start_label = self.next_label.fetch_add(num_vectors as i64, Ordering::Relaxed);
         let labels: Vec<i64> = (start_label..start_label + num_vectors as i64).collect();
 
-        let vecs: Vec<&[f32]> = (0..num_vectors)
-            .map(|i| &vectors[i * self.dimension..(i + 1) * self.dimension])
-            .collect();
+        let batch = self.make_batch_contiguous(&labels, vectors)?;
 
-        let batch = self.make_batch(&labels, &vecs)?;
-
-        let table = self.table.read();
-        let table = table.as_ref().ok_or_else(|| anyhow!("table not open"))?;
+        let table = self.get_table()?;
         let batches = RecordBatchIterator::new(vec![Ok(batch)], self.schema.clone());
         runtime::block_on(table.add(Box::new(batches)).execute())?;
 
@@ -137,8 +152,7 @@ impl LanceIndex {
             ));
         }
 
-        let table = self.table.read();
-        let table = table.as_ref().ok_or_else(|| anyhow!("table not open"))?;
+        let table = self.get_table()?;
 
         let results = runtime::block_on(
             table
@@ -150,83 +164,95 @@ impl LanceIndex {
                 .execute(),
         )?;
 
-        let mut output = Vec::new();
-        let batches: Vec<RecordBatch> = runtime::block_on(async {
-            let mut batches = Vec::new();
+        let mut output = Vec::with_capacity(k);
+
+        runtime::block_on(async {
             let mut stream = results;
-            loop {
-                match stream.try_next().await {
-                    Ok(Some(batch)) => batches.push(batch),
-                    Ok(None) => break,
-                    Err(e) => return Err(anyhow!("stream error: {}", e)),
+            while let Some(batch) = stream.try_next().await
+                .map_err(|e| anyhow!("stream error: {}", e))? {
+                let label_col = batch
+                    .column_by_name("label")
+                    .ok_or_else(|| anyhow!("missing label column"))?;
+                let labels = label_col
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| anyhow!("label column not Int64"))?;
+
+                let dist_col = batch
+                    .column_by_name("_distance")
+                    .ok_or_else(|| anyhow!("missing _distance column"))?;
+                let distances = dist_col
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or_else(|| anyhow!("distance column not Float32"))?;
+
+                for i in 0..batch.num_rows() {
+                    output.push((labels.value(i), distances.value(i)));
                 }
             }
-            Ok(batches)
+            Ok::<(), anyhow::Error>(())
         })?;
-
-        for batch in &batches {
-            let label_col = batch
-                .column_by_name("label")
-                .ok_or_else(|| anyhow!("missing label column"))?;
-            let labels = label_col
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| anyhow!("label column not Int64"))?;
-
-            let dist_col = batch
-                .column_by_name("_distance")
-                .ok_or_else(|| anyhow!("missing _distance column"))?;
-            let distances = dist_col
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| anyhow!("distance column not Float32"))?;
-
-            for i in 0..batch.num_rows() {
-                output.push((labels.value(i), distances.value(i)));
-            }
-        }
 
         Ok(output)
     }
 
     /// Delete a vector by label.
     pub fn delete(&self, label: i64) -> Result<()> {
-        let table = self.table.read();
-        let table = table.as_ref().ok_or_else(|| anyhow!("table not open"))?;
+        let table = self.get_table()?;
         runtime::block_on(table.delete(&format!("label = {}", label)))?;
+        Ok(())
+    }
+
+    /// Delete multiple vectors by label in a single operation.
+    pub fn delete_batch(&self, labels: &[i64]) -> Result<()> {
+        if labels.is_empty() {
+            return Ok(());
+        }
+        let table = self.get_table()?;
+
+        let csv: String = labels.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(", ");
+        let predicate = format!("label IN ({})", csv);
+        runtime::block_on(table.delete(&predicate))?;
         Ok(())
     }
 
     /// Count vectors.
     pub fn count(&self) -> Result<u64> {
-        let table = self.table.read();
-        let table = table.as_ref().ok_or_else(|| anyhow!("table not open"))?;
+        let table = self.get_table()?;
         let count = runtime::block_on(table.count_rows(None))?;
         Ok(count as u64)
     }
 
     /// Create an ANN index (IVF_PQ).
+    ///
+    /// Pass 0 for num_partitions or num_sub_vectors to use LanceDB defaults.
     pub fn create_ann_index(
         &self,
-        _num_partitions: u32,
-        _num_sub_vectors: u32,
+        num_partitions: u32,
+        num_sub_vectors: u32,
     ) -> Result<()> {
-        let table = self.table.read();
-        let table = table.as_ref().ok_or_else(|| anyhow!("table not open"))?;
+        let table = self.get_table()?;
 
+        use lancedb::index::vector::IvfPqIndexBuilder;
         use lancedb::index::Index;
-        let _metric_type = match self.metric.as_str() {
+
+        let distance_type = match self.metric.as_str() {
             "cosine" => lancedb::DistanceType::Cosine,
-            "dot" | "ip" | "inner_product" => lancedb::DistanceType::Dot,
+            "dot" | "ip" => lancedb::DistanceType::Dot,
             _ => lancedb::DistanceType::L2,
         };
 
+        let mut builder = IvfPqIndexBuilder::default().distance_type(distance_type);
+        if num_partitions > 0 {
+            builder = builder.num_partitions(num_partitions);
+        }
+        if num_sub_vectors > 0 {
+            builder = builder.num_sub_vectors(num_sub_vectors);
+        }
+
         runtime::block_on(
             table
-                .create_index(
-                    &["vector"],
-                    Index::Auto,
-                )
+                .create_index(&["vector"], Index::IvfPq(builder))
                 .replace(true)
                 .execute(),
         )?;
@@ -236,16 +262,14 @@ impl LanceIndex {
 
     /// Compact the dataset (optimize storage).
     pub fn compact(&self) -> Result<()> {
-        let table = self.table.read();
-        let table = table.as_ref().ok_or_else(|| anyhow!("table not open"))?;
+        let table = self.get_table()?;
         runtime::block_on(table.optimize(lancedb::table::OptimizeAction::All)).map(|_| ())?;
         Ok(())
     }
 
     /// Get a vector by label.
     pub fn get_vector(&self, label: i64) -> Result<Vec<f32>> {
-        let table = self.table.read();
-        let table = table.as_ref().ok_or_else(|| anyhow!("table not open"))?;
+        let table = self.get_table()?;
 
         let results = runtime::block_on(
             table
@@ -287,6 +311,56 @@ impl LanceIndex {
         }
 
         Err(anyhow!("label {} not found", label))
+    }
+
+    /// Get all vectors as a flat contiguous f32 array and their labels.
+    /// Returns (labels, flat_vectors) where flat_vectors has length labels.len() * dimension.
+    pub fn get_all_vectors(&self) -> Result<(Vec<i64>, Vec<f32>)> {
+        let table = self.get_table()?;
+
+        let results = runtime::block_on(
+            table
+                .query()
+                .execute(),
+        )?;
+
+        let mut all_labels = Vec::new();
+        let mut all_vectors = Vec::new();
+
+        runtime::block_on(async {
+            let mut stream = results;
+            while let Some(batch) = stream.try_next().await
+                .map_err(|e| anyhow!("stream error: {}", e))? {
+                let label_col = batch
+                    .column_by_name("label")
+                    .ok_or_else(|| anyhow!("missing label column"))?;
+                let labels = label_col
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| anyhow!("label column not Int64"))?;
+
+                let vec_col = batch
+                    .column_by_name("vector")
+                    .ok_or_else(|| anyhow!("missing vector column"))?;
+                let list_array = vec_col
+                    .as_any()
+                    .downcast_ref::<FixedSizeListArray>()
+                    .ok_or_else(|| anyhow!("vector not FixedSizeList"))?;
+
+                for i in 0..batch.num_rows() {
+                    all_labels.push(labels.value(i));
+                    let values = list_array.value(i);
+                    let float_array = values
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .ok_or_else(|| anyhow!("vector values not Float32"))?;
+                    all_vectors.extend_from_slice(float_array.values());
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })?;
+
+        Ok((all_labels, all_vectors))
     }
 
     /// Serialize metadata (not vector data — Lance handles that on disk).
@@ -336,6 +410,17 @@ impl LanceIndex {
         let list = Self::make_fixed_size_list(values, dimension as i32);
         Ok(RecordBatch::try_new(schema.clone(), vec![
             Arc::new(labels),
+            Arc::new(list),
+        ])?)
+    }
+
+    /// Build a RecordBatch from already-contiguous flat vector data (no re-flattening needed).
+    fn make_batch_contiguous(&self, labels: &[i64], flat_vectors: &[f32]) -> Result<RecordBatch> {
+        let label_array = Int64Array::from(labels.to_vec());
+        let values = Float32Array::from(flat_vectors.to_vec());
+        let list = Self::make_fixed_size_list(values, self.dimension as i32);
+        Ok(RecordBatch::try_new(self.schema.clone(), vec![
+            Arc::new(label_array),
             Arc::new(list),
         ])?)
     }

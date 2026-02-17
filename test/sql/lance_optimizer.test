@@ -29,5 +29,47 @@ SELECT count(*) FROM lance_search('vectors', 'idx', [1.0, 0.0, 0.0], 2);
 ----
 2
 
+# Optimizer rewrite: ORDER BY array_distance() LIMIT k → index scan
+query I
+SELECT v.id
+FROM vectors v
+ORDER BY array_distance(v.embedding, [1.0, 0.0, 0.0]::FLOAT[3])
+LIMIT 2;
+----
+1
+4
+
+# ORDER BY DESC should NOT be rewritten (wants farthest, not nearest)
+# Farthest from [1,0,0] are [0,0,1] and [0,1,0] (distance 2.0 each)
+query I
+SELECT v.id
+FROM vectors v
+ORDER BY array_distance(v.embedding, [1.0, 0.0, 0.0]::FLOAT[3]) DESC
+LIMIT 2;
+----
+2
+3
+
+# OFFSET should NOT be rewritten — falls back to normal execution
+query I
+SELECT v.id
+FROM vectors v
+ORDER BY array_distance(v.embedding, [1.0, 0.0, 0.0]::FLOAT[3])
+LIMIT 1 OFFSET 1;
+----
+4
+
+# Optimizer + DELETE: delete a row then check optimizer query
+statement ok
+DELETE FROM vectors WHERE id = 1;
+
+query I
+SELECT v.id
+FROM vectors v
+ORDER BY array_distance(v.embedding, [1.0, 0.0, 0.0]::FLOAT[3])
+LIMIT 1;
+----
+4
+
 statement ok
 DROP INDEX idx;

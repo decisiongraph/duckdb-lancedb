@@ -71,9 +71,7 @@ static void LanceCreateAnnScan(ClientContext &context, TableFunctionInput &data,
 	}
 
 	auto &lance_idx = index_ptr->Cast<LanceIndex>();
-	// Access the rust handle through the friend relationship
-	// Since we can't directly access private members, call through the FFI
-	// This is a simplification — in practice the index object would expose this
+	lance_idx.CreateAnnIndex(bind.num_partitions, bind.num_sub_vectors);
 
 	output.data[0].SetValue(0, Value("ANN index created"));
 	output.SetCardinality(1);
